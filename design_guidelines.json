@@ -1,0 +1,130 @@
+{
+  "project_name": "IntelligenceOS",
+  "theme": "dark",
+  "archetype": "Swiss & High-Contrast / Retro-Futurism Hybrid",
+  "typography": {
+    "fonts": {
+      "headings": "Inter",
+      "body": "Inter",
+      "data_and_tickers": "JetBrains Mono"
+    },
+    "rules": {
+      "h1_h2": "Never use default font weights for headings. Use font-light (300) with tracking-tighter for a sophisticated, editorial tech feel, OR font-black (900) for massive structural impact. Max size text-5xl.",
+      "body": "Use Inter text-sm or text-xs for high-density tables. leading-tight.",
+      "data": "Use JetBrains Mono for ALL numbers, currency, percentages, and tickers. Apply tracking-tight and text-right for numeric columns.",
+      "overline": "Uppercase, text-xs, tracking-[0.2em] for widget headers and AI panel labels."
+    }
+  },
+  "colors": {
+    "background": {
+      "base": "#090A0C",
+      "panel": "#121418",
+      "surface_hover": "#1C1F26"
+    },
+    "border": {
+      "default": "#22262E",
+      "focus": "#4B5563"
+    },
+    "text": {
+      "primary": "#F3F4F6",
+      "secondary": "#9CA3AF",
+      "muted": "#6B7280"
+    },
+    "semantic": {
+      "positive": "#22C55E",
+      "negative": "#EF4444",
+      "warning": "#F59E0B",
+      "accent_terminal": "#F97316",
+      "ai_insight": "#818CF8"
+    },
+    "rules": "No pure black (#000000). No gradient backgrounds on surfaces. Use solid backgrounds with 1px borders for a sharp, technical 'Bloomberg Terminal' aesthetic. Semantic colors must be tested for APCA contrast against #121418."
+  },
+  "grids_and_layouts": {
+    "philosophy": "High Information Density. The user is an analyst, not a casual consumer. Do not waste space.",
+    "spacing_scale": "p-2, p-3, p-4 (inside widgets). Avoid p-8+ inside data views.",
+    "global_layout": {
+      "sidebar": "w-16 to w-64 (collapsible), fixed left, border-r.",
+      "header": "h-14, fixed top, border-b, backdrop-blur-md bg-[#090A0C]/80.",
+      "content": "ml-64 mt-14 p-4 or p-6."
+    },
+    "dashboard_grid": "grid-cols-12. gap-4. Widgets span col-span-3, col-span-4, col-span-6, or col-span-12. Use masonry or dense grid-auto-flow if needed.",
+    "bento_rules": "Avoid equal squares. Mix tall lists (row-span-2) with wide charts (col-span-8). Every pixel must be utilized."
+  },
+  "surfaces_and_borders": {
+    "card_style": "Flat Solid. bg-[#121418] border border-[#22262E]. NO shadows (shadows are invisible in dark mode anyway).",
+    "radius": "rounded-md (max 6px). We want sharp, analytical edges, not bubbly consumer apps.",
+    "glassmorphism": "Only use for sticky headers or dropdown menus (backdrop-blur-xl bg-[#090A0C]/70 border border-white/10). Do not use for data cards."
+  },
+  "component_guidelines": {
+    "ai_panels": "Every AI panel must use Shadcn Tabs. TabsList must be border-b border-[#22262E] with transparent background, TabTrigger active state should have an orange or indigo bottom border. Tabs: Summary, Evidence, Sources, Confidence, Assumptions.",
+    "tables": "Dense. py-2 px-3 cells. border-b border-[#22262E]. JetBrains Mono for data columns. Hover state: bg-[#1C1F26].",
+    "badges": "For tickers (e.g., AAPL): border border-[#22262E] bg-transparent text-white rounded px-1.5 py-0.5 text-xs.",
+    "search": "CMD+K palette must be heavily styled. Dark blurred backdrop, crisp borders, JetBrains mono hints.",
+    "knowledge_graph": "Use React Flow. Nodes should follow the card_style (bg-panel, 1px border). Edges should be muted lines (#4B5563)."
+  },
+  "motion_and_interactions": {
+    "hover_states": "All interactive rows and buttons must transition instantly or very fast (duration-150). Change background lightness or add a 1px border highlight.",
+    "micro_interactions": "Use subtle text color shifts (muted to primary) and border color shifts. No bouncy animations.",
+    "loaders": "Replace spinners with ASCII-style loaders or sequential data-loading text ('Fetching sources...', 'Calculating confidence...')."
+  },
+  "3d_and_visual_enhancers": {
+    "charts": "Use Recharts or Shadcn Charts. Line charts must have thin bright lines (strokeWidth={1.5}) and subtle gradient fills (opacity 0.1).",
+    "accents": "Use a 1px 'Tracing Beam' or glowing top border (border-t-orange-500) on active/selected widgets to draw the eye."
+  },
+  "image_urls": {
+    "avatars": [
+      {
+        "url": "https://images.unsplash.com/photo-1580489944761-15a19d654956?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NTY2NjZ8MHwxfHNlYXJjaHw0fHxwcm9mZXNzaW9uYWwlMjB0ZWFtJTIwYXZhdGFyJTIwaGVhZHNob3R8ZW58MHx8fHwxNzg0MzIzNDEyfDA&ixlib=rb-4.1.0&q=85",
+        "description": "Team member avatar 1"
+      },
+      {
+        "url": "https://images.unsplash.com/photo-1494790108377-be9c29b29330?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NTY2NjZ8MHwxfHNlYXJjaHwyfHxwcm9mZXNzaW9uYWwlMjB0ZWFtJTIwYXZhdGFyJTIwaGVhZHNob3R8ZW58MHx8fHwxNzg0MzIzNDEyfDA&ixlib=rb-4.1.0&q=85",
+        "description": "Team member avatar 2"
+      },
+      {
+        "url": "https://images.unsplash.com/photo-1500648767791-00dcc994a43e?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NTY2NjZ8MHwxfHNlYXJjaHwzfHxwcm9mZXNzaW9uYWwlMjB0ZWFtJTIwYXZhdGFyJTIwaGVhZHNob3R8ZW58MHx8fHwxNzg0MzIzNDEyfDA&ixlib=rb-4.1.0&q=85",
+        "description": "Team member avatar 3"
+      },
+      {
+        "url": "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NTY2NjZ8MHwxfHNlYXJjaHwxfHxwcm9mZXNzaW9uYWwlMjB0ZWFtJTIwYXZhdGFyJTIwaGVhZHNob3R8ZW58MHx8fHwxNzg0MzIzNDEyfDA&ixlib=rb-4.1.0&q=85",
+        "description": "Team member avatar 4"
+      }
+    ],
+    "backgrounds": [
+      {
+        "url": "https://images.unsplash.com/photo-1689443111130-6e9c7dfd8f9e?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NDk1Nzd8MHwxfHNlYXJjaHwzfHxmaW5hbmNlJTIwdGVjaCUyMGFic3RyYWN0JTIwYmFja2dyb3VuZCUyMGRhcmt8ZW58MHx8fHwxNzg0MzIzNDEyfDA&ixlib=rb-4.1.0&q=85",
+        "description": "Dark geometric background for auth pages or hero sections"
+      }
+    ]
+  },
+  "icons": {
+    "library": "lucide-react",
+    "usage": "Use 16px (w-4 h-4) icons for dense dashboard layouts. Stroke width 1.5 or 2."
+  },
+  "instructions_to_main_agent": {
+    "1": "You must implement a strict dark theme default. Configure Tailwind config with the custom colors provided.",
+    "2": "Create a robust layout wrapper with a collapsible Left Sidebar and Top Nav. Implement routing for: Command Center, Markets, Companies, Portfolio, Research, AI Agents, Screeners, Documents, Alerts, Knowledge Graph, Team, Settings.",
+    "3": "Every AI panel must be built as a reusable component using Shadcn Tabs (Summary, Evidence, Sources, Confidence, Assumptions).",
+    "4": "Use JetBrains Mono for ALL tabular financial data, metrics, and stock tickers. Ensure correct text-alignment (right for numbers).",
+    "5": "Do not center align application wrappers. Left-align dense data.",
+    "6": "Add data-testid attributes to all interactive elements.",
+    "7": "Use pure HTML/Tailwind for structural bento grid layouts; strictly use Shadcn for interactive pieces (selects, modals, tabs).",
+    "8": "Use Recharts or Shadcn Charts for visualizing market data and Portfolio allocation. Apply the dark mode semantic colors.",
+    "9": "Install and configure `reactflow` for the Knowledge Graph UI."
+  },
+  "UNIVERSAL_GUIDELINES_FOR_MAIN_AGENT": [
+    "You tend to converge toward generic, 'on distribution' outputs. In frontend design, this creates what users call the 'AI slop' aesthetic. Avoid this: make creative, distinctive frontends that surprise and delight.",
+    "Dark colors look good when used independently without gradients. DO NOT use dark colors as gradients.",
+    "Don't make generic centered layouts, simplistic gradients, and uniform styling.",
+    "Create depth through layered design elements with z-index hierarchy and subtle borders, rather than drop shadows.",
+    "Use glass-morphism effects with backdrop filters (12-24px blur) ONLY on overlays, popovers, and sticky headers.",
+    "You MUST NOT apply universal transition. Eg: `transition: all`. This results in breaking transforms. Always add transitions for specific interactive elements.",
+    "You MUST NOT center align the app container, ie do not add `.App { text-align: center; }` in the css file. This disrupts the human natural reading flow of text.",
+    "Always use modern button styles like pill-shaped, or sharp button with interaction animations & color relevant to the app style.",
+    "NEVER: use AI assistant Emoji characters like 🤖🧠💭💡🔮🎯 etc for icons. Use Lucide icons.",
+    "Every interaction needs micro-animations - hover states, transitions. Static = dead.",
+    "Prioritize using pre-existing components from src/components/ui when applicable.",
+    "Use `sonner` for toasts.",
+    "Add data-testid to all interactive elements."
+  ]
+}

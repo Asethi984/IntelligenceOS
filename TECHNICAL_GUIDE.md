@@ -299,20 +299,28 @@ sequenceDiagram
 
 ## 8. AI Agent System
 
-### 8.1 The 9 agents
+### 8.1 The 17 agents
 Defined in `AGENT_SYSTEM` dict in `server.py`:
 
 | Key | Role |
 |---|---|
 | `research` | Senior equity research analyst |
-| `financial` | CFA financial analyst (ratios, quality of earnings) |
-| `news` | News impact analyst (materiality, sentiment) |
+| `financial` | CFA financial analyst |
+| `news` | News impact analyst |
 | `competitor` | Competitive strategy (Porter, moat) |
-| `risk` | Risk analyst (tail risks, mitigations) |
-| `valuation` | DCF / comps / scenario logic |
+| `risk` | Risk analyst |
+| `valuation` | DCF / comps / scenario |
 | `macro` | Macro strategist |
 | `market_brief` | Daily market strategist |
 | `portfolio_brief` | Portfolio daily brief |
+| `contradiction` | **NEW** — finds contradictions across 10-K, calls, guidance, news |
+| `management` | **NEW** — capital allocation + execution scoring |
+| `materiality` | **NEW** — 0–100 news impact scoring |
+| `earnings_diff` | **NEW** — quarter-over-quarter line-by-line diff |
+| `bias` | **NEW** — behavioral finance coach over Decision Journal |
+| `assumption_check` | **NEW** — evaluates a single thesis assumption → intact/at_risk/broken |
+| `hidden_connections` | **NEW** — clusters holdings by shared thesis driver |
+| `macro_exposure` | **NEW** — scores portfolio's factor exposure |
 
 ### 8.2 Unified structured output contract
 Every agent is forced (via appended system instruction) to return **strict JSON**:

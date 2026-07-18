@@ -6,7 +6,7 @@ import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { toast } from "sonner";
-import { Plus, Trash2, ArrowRight } from "lucide-react";
+import { Plus, Trash2, ArrowRight, Sparkles } from "lucide-react";
 
 const STAGES = ["idea","research","validation","buy","monitor","review","archive"];
 const STAGE_LABELS = { idea: "Idea", research: "Research", validation: "Validation", buy: "Buy", monitor: "Monitor", review: "Review", archive: "Archive" };
@@ -49,7 +49,11 @@ export default function Pipeline() {
           <h1 className="text-3xl font-light tracking-tighter">Investment Pipeline</h1>
           <p className="text-xs text-muted-foreground mt-1 font-mono">Idea → Research → Validation → Buy → Monitor → Review → Archive</p>
         </div>
-        <Dialog open={open} onOpenChange={setOpen}>
+        <div className="flex gap-2">
+          <Button size="sm" variant="outline" className="border-line" onClick={async () => { await api.post("/demo/seed"); toast.success("Demo pipeline loaded"); load(); }} data-testid="seed-pipeline-btn">
+            <Sparkles className="w-3.5 h-3.5 mr-1" /> Load Sample
+          </Button>
+          <Dialog open={open} onOpenChange={setOpen}>
           <DialogTrigger asChild>
             <Button size="sm" className="bg-terminal text-black hover:bg-terminal/90" data-testid="add-pipeline-btn">
               <Plus className="w-3.5 h-3.5 mr-1" /> Add to Pipeline
@@ -68,6 +72,7 @@ export default function Pipeline() {
             </div>
           </DialogContent>
         </Dialog>
+        </div>
       </div>
 
       <div className="grid grid-cols-7 gap-3 min-h-[70vh]">

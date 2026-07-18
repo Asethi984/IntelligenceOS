@@ -6,7 +6,7 @@ import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { toast } from "sonner";
-import { Plus, Trash2, Brain } from "lucide-react";
+import { Plus, Trash2, Brain, Sparkles } from "lucide-react";
 
 const ACTION_COLORS = { buy: "text-positive border-positive", sell: "text-negative border-negative", hold: "text-warning border-warning", watch: "text-insight border-insight" };
 
@@ -65,6 +65,9 @@ export default function Journal() {
           <p className="text-xs text-muted-foreground mt-1 font-mono">Every buy/sell captured · learn from your own patterns</p>
         </div>
         <div className="flex gap-2">
+          <Button size="sm" variant="outline" className="border-line" onClick={async () => { await api.post("/demo/seed"); toast.success("Demo data loaded"); load(); }} data-testid="seed-demo-btn">
+            <Sparkles className="w-3.5 h-3.5 mr-1" /> Load Sample
+          </Button>
           <Button size="sm" variant="outline" className="border-line" onClick={analyze} data-testid="analyze-bias-btn">
             <Brain className="w-3.5 h-3.5 mr-1" /> Detect Biases
           </Button>

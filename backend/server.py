@@ -20,6 +20,9 @@ import bcrypt
 import httpx
 import yfinance as yf
 from emergentintegrations.llm.chat import LlmChat, UserMessage
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from rank_bm25 import BM25Okapi
+import re as _re
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -703,9 +706,40 @@ async def dcf(body: DCFBody, user=Depends(get_current_user)):
     }
 
 
-# ---------------- Documents (RAG light) ----------------
+# ---------------- Documents (RAG with BM25 chunk retrieval) ----------------
+def _chunk_text(text: str, size: int = 700, overlap: int = 100) -> List[str]:
+    """Word-based chunker with overlap."""
+    words = text.split()
+    if not words:
+        return []
+    chunks = []
+    i = 0
+    while i < len(words):
+        chunks.append(" ".join(words[i:i + size]))
+        i += (size - overlap)
+    return chunks
+
+_TOKEN_RE = _re.compile(r"[A-Za-z0-9]+")
+def _tokenize(s: str) -> List[str]:
+    return [t.lower() for t in _TOKEN_RE.findall(s)]
+
+async def _bm25_retrieve(user_id: str, query: str, ticker: Optional[str] = None, top_k: int = 8) -> List[Dict[str, Any]]:
+    """Retrieve top-K chunks across user's documents using BM25."""
+    q = {"user_id": user_id}
+    if ticker:
+        q["ticker"] = ticker.upper()
+    chunks = await db.document_chunks.find(q, {"_id": 0}).to_list(5000)
+    if not chunks:
+        return []
+    corpus = [_tokenize(c["text"]) for c in chunks]
+    bm25 = BM25Okapi(corpus)
+    query_tokens = _tokenize(query) or ["contradiction", "risk", "guidance"]
+    scores = bm25.get_scores(query_tokens)
+    ranked = sorted(zip(chunks, scores), key=lambda x: x[1], reverse=True)
+    return [{"chunk": c, "score": float(s)} for c, s in ranked[:top_k] if s > 0]
+
 @api.post("/documents/upload")
-async def upload_doc(file: UploadFile = File(...), user=Depends(get_current_user)):
+async def upload_doc(file: UploadFile = File(...), ticker: Optional[str] = None, user=Depends(get_current_user)):
     content = await file.read()
     text = ""
     if file.filename.lower().endswith(".pdf"):
@@ -721,16 +755,35 @@ async def upload_doc(file: UploadFile = File(...), user=Depends(get_current_user
             text = content.decode("utf-8", errors="ignore")
         except Exception:
             text = ""
-    doc = {"doc_id": str(uuid.uuid4()), "user_id": user["user_id"],
+    doc_id = str(uuid.uuid4())
+    doc = {"doc_id": doc_id, "user_id": user["user_id"],
            "filename": file.filename, "text": text[:200000],
-           "size": len(content), "created_at": now_iso()}
+           "ticker": (ticker or "").upper() or None,
+           "size": len(content), "created_at": now_iso(),
+           "chunk_count": 0}
+    # chunk & store
+    chunks = _chunk_text(text[:200000])
+    chunk_docs = [{
+        "chunk_id": str(uuid.uuid4()), "doc_id": doc_id, "user_id": user["user_id"],
+        "filename": file.filename, "ticker": doc["ticker"],
+        "chunk_idx": i, "text": ch, "created_at": now_iso(),
+    } for i, ch in enumerate(chunks)]
+    doc["chunk_count"] = len(chunk_docs)
     await db.documents.insert_one(doc)
-    return {"doc_id": doc["doc_id"], "filename": file.filename, "chars": len(text)}
+    if chunk_docs:
+        await db.document_chunks.insert_many(chunk_docs)
+    return {"doc_id": doc_id, "filename": file.filename, "chars": len(text), "chunks": len(chunk_docs)}
 
 @api.get("/documents")
 async def list_documents(user=Depends(get_current_user)):
     docs = await db.documents.find({"user_id": user["user_id"]}, {"_id": 0, "text": 0}).sort("created_at", -1).to_list(100)
     return docs
+
+@api.delete("/documents/{doc_id}")
+async def delete_document(doc_id: str, user=Depends(get_current_user)):
+    await db.documents.delete_one({"doc_id": doc_id, "user_id": user["user_id"]})
+    await db.document_chunks.delete_many({"doc_id": doc_id, "user_id": user["user_id"]})
+    return {"ok": True}
 
 @api.post("/documents/{doc_id}/ask")
 async def ask_doc(doc_id: str, body: Dict[str, Any], user=Depends(get_current_user)):
@@ -738,8 +791,42 @@ async def ask_doc(doc_id: str, body: Dict[str, Any], user=Depends(get_current_us
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
     question = body.get("question", "")
-    ctx = f"Document '{doc['filename']}':\n{doc['text'][:8000]}"
-    result = await run_agent("research", question, ctx)
+    # BM25 retrieve within THIS doc for scoped question
+    chunks = await db.document_chunks.find({"doc_id": doc_id, "user_id": user["user_id"]}, {"_id": 0}).to_list(1000)
+    if chunks and question:
+        corpus = [_tokenize(c["text"]) for c in chunks]
+        bm25 = BM25Okapi(corpus)
+        scores = bm25.get_scores(_tokenize(question))
+        top = sorted(zip(chunks, scores), key=lambda x: x[1], reverse=True)[:5]
+        ctx_parts = [f"[chunk {c['chunk_idx']}] {c['text']}" for c, s in top if s > 0]
+        ctx = f"Document '{doc['filename']}':\n" + "\n\n".join(ctx_parts)
+    else:
+        ctx = f"Document '{doc['filename']}':\n{doc['text'][:8000]}"
+    return await run_agent("research", question, ctx)
+
+@api.post("/documents/contradiction")
+async def find_contradictions(body: Dict[str, Any], user=Depends(get_current_user)):
+    """Cross-document contradiction detection via BM25 chunk retrieval + LLM."""
+    ticker = body.get("ticker")
+    query = body.get("query") or "contradictions inconsistencies between guidance, financials, risk factors, and management statements"
+    hits = await _bm25_retrieve(user["user_id"], query, ticker=ticker, top_k=10)
+    if not hits:
+        return {"summary": "No document chunks found. Upload filings, transcripts, or presentations first.",
+                "evidence": [], "sources": [], "confidence": 0, "assumptions": [], "retrieved": 0}
+    # build context with citations
+    ctx_lines = []
+    sources_seen = set()
+    for h in hits:
+        c = h["chunk"]
+        tag = f"[{c['filename']} · chunk {c['chunk_idx']}]"
+        sources_seen.add(c["filename"])
+        ctx_lines.append(f"{tag}\n{c['text']}")
+    ctx = "\n\n---\n\n".join(ctx_lines)
+    prompt = ("Analyze these document excerpts and surface contradictions, inconsistencies, or "
+              "unresolved tensions between claims. Cite the source filename and chunk for each finding.")
+    result = await run_agent("contradiction", prompt, ctx)
+    result["retrieved"] = len(hits)
+    result["source_files"] = sorted(sources_seen)
     return result
 
 
@@ -1093,6 +1180,176 @@ async def timeline(ticker: str, user=Depends(get_current_user)):
     return {"ticker": T, "events": events[:80]}
 
 
+# ---------------- Background Scheduler (auto assumption re-check) ----------------
+scheduler = AsyncIOScheduler(timezone="UTC")
+
+async def _check_earnings_signal(ticker: str) -> Dict[str, Any]:
+    """Return whether an earnings/material signal happened recently for a ticker."""
+    keywords = ("earnings", "quarter", "guidance", "beats", "misses", "revenue", "eps", "outlook")
+    try:
+        tk = yf.Ticker(ticker)
+        news_list = tk.news or []
+        for n in news_list[:15]:
+            title = (n.get("title") or (n.get("content") or {}).get("title") or "").lower()
+            if any(k in title for k in keywords):
+                return {"signal": True, "reason": "news_earnings", "headline": title}
+    except Exception:
+        pass
+    # price move signal
+    try:
+        hist = yf.Ticker(ticker).history(period="5d")
+        if len(hist) >= 2:
+            last = float(hist["Close"].iloc[-1])
+            prev = float(hist["Close"].iloc[-2])
+            move = abs((last - prev) / prev * 100) if prev else 0
+            if move >= 5:
+                return {"signal": True, "reason": "price_move", "move_pct": move}
+    except Exception:
+        pass
+    return {"signal": False}
+
+async def _run_thesis_check_internal(thesis_id: str, user_id: str, reason: str = "auto"):
+    """Reusable internal check (mirrors /thesis/living/{id}/check without HTTPException auth)."""
+    doc = await db.living_theses.find_one({"thesis_id": thesis_id, "user_id": user_id}, {"_id": 0})
+    if not doc:
+        return None
+    try:
+        # fetch profile/quote directly (bypassing Depends)
+        profile_cached = _cache_get(f"profile:{doc['ticker']}", 3600)
+        if not profile_cached:
+            try:
+                info = yf.Ticker(doc["ticker"]).info or {}
+                profile_cached = {"name": info.get("shortName"), "sector": info.get("sector"),
+                                  "pe": info.get("trailingPE"), "summary": info.get("longBusinessSummary")}
+                _cache_set(f"profile:{doc['ticker']}", profile_cached)
+            except Exception:
+                profile_cached = {}
+        quote = _fetch_quote(doc["ticker"])
+        ctx = f"Ticker {doc['ticker']} · {profile_cached.get('name')} · Sector {profile_cached.get('sector')} · Price ${quote.get('price')} · Trigger: {reason}. Business: {(profile_cached.get('summary') or '')[:400]}."
+        updated = []
+        for a in doc.get("assumptions", []):
+            prompt = f"Assumption ({a['kind']}): '{a['text']}'. Determine status. In assumptions field return exactly one of 'INTACT','AT_RISK','BROKEN'."
+            res = await run_agent("assumption_check", prompt, ctx)
+            blob = " ".join(res.get("assumptions", []) + [res.get("summary", "")]).upper()
+            verdict = "broken" if "BROKEN" in blob else ("at_risk" if ("AT_RISK" in blob or "AT RISK" in blob) else "intact")
+            updated.append({**a, "status": verdict, "last_checked": now_iso(), "reasoning": res.get("summary", "")})
+        await db.living_theses.update_one({"thesis_id": thesis_id}, {"$set": {"assumptions": updated, "last_checked": now_iso(), "last_check_reason": reason}})
+        # audit
+        await db.scheduler_runs.insert_one({
+            "run_id": str(uuid.uuid4()), "thesis_id": thesis_id, "user_id": user_id,
+            "ticker": doc["ticker"], "reason": reason, "at": now_iso(),
+            "at_risk_count": sum(1 for u in updated if u["status"] == "at_risk"),
+            "broken_count": sum(1 for u in updated if u["status"] == "broken"),
+        })
+        return updated
+    except Exception as e:
+        logger.error(f"scheduler check failed for {thesis_id}: {e}")
+        return None
+
+async def thesis_auto_recheck_job():
+    """Runs periodically. For each latest-version living thesis, if a material signal (earnings news
+    or >=5% price move) is detected for the ticker, run the assumption check."""
+    logger.info("scheduler: starting thesis auto-recheck")
+    all_theses = await db.living_theses.find({}, {"_id": 0}).sort("version", -1).to_list(5000)
+    seen_chains = set()
+    latest = []
+    for t in all_theses:
+        chain = t.get("chain_id") or t["thesis_id"]
+        if chain in seen_chains:
+            continue
+        seen_chains.add(chain)
+        latest.append(t)
+    checked = 0
+    for t in latest:
+        signal = await _check_earnings_signal(t["ticker"])
+        if signal.get("signal"):
+            await _run_thesis_check_internal(t["thesis_id"], t["user_id"], reason=signal.get("reason", "auto"))
+            checked += 1
+    logger.info(f"scheduler: checked {checked}/{len(latest)} theses")
+
+@api.get("/scheduler/status")
+async def scheduler_status(user=Depends(get_current_user)):
+    jobs = [{"id": j.id, "next_run": str(j.next_run_time)} for j in scheduler.get_jobs()]
+    runs = await db.scheduler_runs.find({"user_id": user["user_id"]}, {"_id": 0}).sort("at", -1).to_list(50)
+    return {"jobs": jobs, "recent_runs": runs}
+
+@api.post("/scheduler/run-now")
+async def scheduler_run_now(user=Depends(get_current_user)):
+    """Manually trigger the auto-recheck for the current user's theses only (fast path)."""
+    theses = await db.living_theses.find({"user_id": user["user_id"]}, {"_id": 0}).sort("version", -1).to_list(500)
+    seen = set()
+    latest = []
+    for t in theses:
+        chain = t.get("chain_id") or t["thesis_id"]
+        if chain in seen: continue
+        seen.add(chain); latest.append(t)
+    triggered = []
+    for t in latest:
+        signal = await _check_earnings_signal(t["ticker"])
+        if signal.get("signal"):
+            await _run_thesis_check_internal(t["thesis_id"], t["user_id"], reason=signal.get("reason", "manual"))
+            triggered.append({"ticker": t["ticker"], "reason": signal.get("reason")})
+    return {"scanned": len(latest), "triggered": triggered}
+
+
+# ---------------- Demo Seed ----------------
+DEMO_JOURNAL = [
+    {"ticker":"NVDA","action":"buy","decision_reason":"AI infra demand looks unstoppable; Blackwell ramp + data-center capex from hyperscalers underpins revenue.","expected_outcome":"Revenue growth >40% next 4 quarters, stock re-rates to 40x fwd.","expected_timeframe_months":18,"confidence":80},
+    {"ticker":"TSLA","action":"sell","decision_reason":"FSD progress overhyped; EV competition intensifying; margins compressing.","expected_outcome":"Multiple contracts as auto-margin story fades.","expected_timeframe_months":12,"confidence":65},
+    {"ticker":"AAPL","action":"hold","decision_reason":"Services growth intact but iPhone units flattening; waiting for AI Siri catalyst.","expected_outcome":"Sideways action until WWDC.","expected_timeframe_months":9,"confidence":55},
+    {"ticker":"AMD","action":"buy","decision_reason":"MI300 traction better than expected; taking share in AI accelerators.","expected_outcome":"Data-center revenue doubles within 18mo.","expected_timeframe_months":15,"confidence":70},
+    {"ticker":"META","action":"buy","decision_reason":"Reels monetization plus AI targeting; capex bloat is temporary.","expected_outcome":"Op margin recovers to 40%+.","expected_timeframe_months":24,"confidence":72},
+    {"ticker":"GOOGL","action":"watch","decision_reason":"Search moat under real AI threat for first time; watching Gemini reception.","expected_outcome":"Determine buy vs skip by end of quarter.","expected_timeframe_months":3,"confidence":50},
+]
+DEMO_PIPELINE = [
+    ("PLTR","idea","AI + govt tailwind, but valuation stretched"),
+    ("SHOP","idea","E-commerce recovery play"),
+    ("SNOW","research","Consumption model showing durability"),
+    ("CRWD","research","Cyber consolidation winner"),
+    ("MDB","validation","Vector search moat vs Elastic"),
+    ("ANET","validation","AI networking silent winner"),
+    ("NVDA","buy","AI infrastructure king · 8% position"),
+    ("META","monitor","Ad growth + Reels · watching margin path"),
+    ("AAPL","monitor","Services + WWDC catalyst"),
+    ("PYPL","review","Thesis broken · execution poor"),
+    ("PTON","archive","Failed turnaround"),
+]
+
+@api.post("/demo/seed")
+async def demo_seed(user=Depends(get_current_user)):
+    """Idempotent-ish seed: adds demo journal + pipeline entries for the current user."""
+    j_added, p_added = 0, 0
+    for d in DEMO_JOURNAL:
+        q = _fetch_quote(d["ticker"])
+        entry = {
+            "entry_id": str(uuid.uuid4()), "user_id": user["user_id"],
+            "ticker": d["ticker"], "action": d["action"],
+            "decision_reason": d["decision_reason"], "expected_outcome": d["expected_outcome"],
+            "expected_timeframe_months": d["expected_timeframe_months"],
+            "confidence": d["confidence"], "price_at_decision": q.get("price"),
+            "result_outcome": None, "result_summary": None, "lessons": [],
+            "created_at": now_iso(), "resolved_at": None, "demo": True,
+        }
+        await db.journal_entries.insert_one(entry)
+        j_added += 1
+    for tk, stage, note in DEMO_PIPELINE:
+        item = {
+            "item_id": str(uuid.uuid4()), "user_id": user["user_id"],
+            "ticker": tk, "stage": stage, "note": note, "thesis_headline": None,
+            "history": [{"stage": stage, "at": now_iso(), "note": note}],
+            "created_at": now_iso(), "updated_at": now_iso(), "demo": True,
+        }
+        await db.pipeline_items.insert_one(item)
+        p_added += 1
+    return {"journal_added": j_added, "pipeline_added": p_added}
+
+@api.post("/demo/clear")
+async def demo_clear(user=Depends(get_current_user)):
+    j = await db.journal_entries.delete_many({"user_id": user["user_id"], "demo": True})
+    p = await db.pipeline_items.delete_many({"user_id": user["user_id"], "demo": True})
+    return {"journal_cleared": j.deleted_count, "pipeline_cleared": p.deleted_count}
+
+
 
 @api.get("/")
 async def root():
@@ -1108,6 +1365,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.on_event("startup")
+async def startup():
+    # Schedule auto-recheck of thesis assumptions every 6 hours.
+    # In production, swap to Celery beat with the same job function.
+    try:
+        scheduler.add_job(thesis_auto_recheck_job, "interval", hours=6, id="thesis_auto_recheck",
+                          next_run_time=datetime.now(timezone.utc) + timedelta(minutes=5),
+                          max_instances=1, coalesce=True)
+        scheduler.start()
+        logger.info("scheduler: started, next run in 5 minutes")
+    except Exception as e:
+        logger.error(f"scheduler failed to start: {e}")
+
 @app.on_event("shutdown")
 async def shutdown():
+    try:
+        scheduler.shutdown(wait=False)
+    except Exception:
+        pass
     client.close()

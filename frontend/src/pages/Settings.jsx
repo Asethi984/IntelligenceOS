@@ -1,7 +1,9 @@
 import { useAuth } from "@/contexts/AuthContext";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
-import { Check } from "lucide-react";
+import { Check, Clock, Zap } from "lucide-react";
+import { useEffect, useState } from "react";
+import api from "@/lib/api";
 
 const TIERS = [
   { name: "Free", price: 0, features: ["Command Center", "5 watchlist tickers", "10 AI queries/mo", "Basic screener"] },
@@ -12,7 +14,20 @@ const TIERS = [
 
 export default function Settings() {
   const { user } = useAuth();
+  const [sched, setSched] = useState(null);
+  const [triggering, setTriggering] = useState(false);
   const upgrade = () => toast("Stripe checkout will activate once keys are configured.", { icon: "⚡" });
+
+  useEffect(() => { api.get("/scheduler/status").then(r => setSched(r.data)).catch(() => {}); }, []);
+
+  const runNow = async () => {
+    setTriggering(true);
+    try {
+      const { data } = await api.post("/scheduler/run-now");
+      toast.success(`Scanned ${data.scanned} theses · ${data.triggered.length} auto-checked`);
+      const s = await api.get("/scheduler/status"); setSched(s.data);
+    } finally { setTriggering(false); }
+  };
 
   return (
     <div className="p-6 space-y-6" data-testid="settings-page">
@@ -26,6 +41,39 @@ export default function Settings() {
           <div><div className="text-muted-foreground text-xs">Role</div><div>{user?.role || "Owner"}</div></div>
           <div><div className="text-muted-foreground text-xs">Current Plan</div><div className="text-terminal">{user?.plan || "Free"}</div></div>
         </div>
+      </div>
+
+      <div className="border border-line bg-panel rounded-md p-5">
+        <div className="flex items-center justify-between mb-3">
+          <div className="flex items-center gap-2"><Clock className="w-4 h-4 text-terminal" /><div className="overline">Background Scheduler · Thesis Auto-Recheck</div></div>
+          <Button size="sm" className="bg-terminal text-black hover:bg-terminal/90 h-7 text-xs" onClick={runNow} disabled={triggering} data-testid="scheduler-run-now-btn">
+            <Zap className="w-3 h-3 mr-1" /> {triggering ? "Running…" : "Trigger Now"}
+          </Button>
+        </div>
+        <div className="text-xs text-muted-foreground mb-3">
+          The scheduler runs every 6 hours. For each living thesis, it checks the ticker for earnings-related news or a ≥5% price move; if either signal fires, it re-runs the AI Assumption Check automatically. All triggered runs appear below.
+        </div>
+        {sched?.jobs?.map(j => (
+          <div key={j.id} className="text-[11px] font-mono text-muted-foreground mb-1">
+            › job <span className="text-foreground">{j.id}</span> · next run <span className="text-terminal">{j.next_run}</span>
+          </div>
+        ))}
+        {sched?.recent_runs?.length > 0 ? (
+          <div className="mt-3 space-y-1">
+            <div className="overline mb-1">Recent Auto-Checks</div>
+            {sched.recent_runs.slice(0, 10).map(r => (
+              <div key={r.run_id} className="text-[11px] font-mono flex items-center gap-3">
+                <span className="text-muted-foreground w-32">{new Date(r.at).toLocaleString()}</span>
+                <span className="text-terminal w-14">{r.ticker}</span>
+                <span className="text-muted-foreground">{r.reason}</span>
+                {r.at_risk_count > 0 && <span className="text-warning">at_risk: {r.at_risk_count}</span>}
+                {r.broken_count > 0 && <span className="text-negative">broken: {r.broken_count}</span>}
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="text-[11px] font-mono text-muted-foreground mt-3">No auto-checks yet. They will populate after the next material event on any of your ticker theses.</div>
+        )}
       </div>
 
       <div>

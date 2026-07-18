@@ -1,53 +1,69 @@
-import { useEffect } from "react";
+import { BrowserRouter, Routes, Route, Navigate, useLocation } from "react-router-dom";
 import "@/App.css";
-import { BrowserRouter, Routes, Route } from "react-router-dom";
-import axios from "axios";
-import { HOME } from "@/constants/testIds";
+import { Toaster } from "@/components/ui/sonner";
+import { AuthProvider } from "@/contexts/AuthContext";
+import ProtectedRoute from "@/components/ProtectedRoute";
+import Layout from "@/components/Layout";
+import Login from "@/pages/Login";
+import AuthCallback from "@/pages/AuthCallback";
+import CommandCenter from "@/pages/CommandCenter";
+import Markets from "@/pages/Markets";
+import CompanyDetail from "@/pages/CompanyDetail";
+import Portfolio from "@/pages/Portfolio";
+import Research from "@/pages/Research";
+import AIAgents from "@/pages/AIAgents";
+import Screeners from "@/pages/Screeners";
+import Valuation from "@/pages/Valuation";
+import Documents from "@/pages/Documents";
+import Alerts from "@/pages/Alerts";
+import KnowledgeGraph from "@/pages/KnowledgeGraph";
+import Team from "@/pages/Team";
+import Settings from "@/pages/Settings";
+import Pipeline from "@/pages/Pipeline";
+import Journal from "@/pages/Journal";
+import Timeline from "@/pages/Timeline";
 
-const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
-const API = `${BACKEND_URL}/api`;
-
-const Home = () => {
-  const helloWorldApi = async () => {
-    try {
-      const response = await axios.get(`${API}/`);
-      console.log(response.data.message);
-    } catch (e) {
-      console.error(e, `errored out requesting / api`);
-    }
-  };
-
-  useEffect(() => {
-    helloWorldApi();
-  }, []);
-
+function AppRouter() {
+  const location = useLocation();
+  if (location.hash?.includes("session_id=")) {
+    return <AuthCallback />;
+  }
   return (
-    <div>
-      <header className="App-header">
-        <a
-          data-testid={HOME.emergentLink}
-          className="App-link"
-          href="https://emergent.sh"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <img src="https://avatars.githubusercontent.com/in/1201222?s=120&u=2686cf91179bbafbc7a71bfbc43004cf9ae1acea&v=4" />
-        </a>
-        <p className="mt-5">Building something incredible ~!</p>
-      </header>
-    </div>
+    <Routes>
+      <Route path="/login" element={<Login mode="login" />} />
+      <Route path="/signup" element={<Login mode="signup" />} />
+      <Route path="/auth/callback" element={<AuthCallback />} />
+      <Route element={<ProtectedRoute><Layout /></ProtectedRoute>}>
+        <Route path="/" element={<CommandCenter />} />
+        <Route path="/markets" element={<Markets />} />
+        <Route path="/company/:ticker" element={<CompanyDetail />} />
+        <Route path="/portfolio" element={<Portfolio />} />
+        <Route path="/research" element={<Research />} />
+        <Route path="/agents" element={<AIAgents />} />
+        <Route path="/screeners" element={<Screeners />} />
+        <Route path="/valuation" element={<Valuation />} />
+        <Route path="/documents" element={<Documents />} />
+        <Route path="/alerts" element={<Alerts />} />
+        <Route path="/graph" element={<KnowledgeGraph />} />
+        <Route path="/pipeline" element={<Pipeline />} />
+        <Route path="/journal" element={<Journal />} />
+        <Route path="/timeline/:ticker" element={<Timeline />} />
+        <Route path="/team" element={<Team />} />
+        <Route path="/settings" element={<Settings />} />
+      </Route>
+      <Route path="*" element={<Navigate to="/" replace />} />
+    </Routes>
   );
-};
+}
 
 function App() {
   return (
     <div className="App">
       <BrowserRouter>
-        <Routes>
-          <Route path="/" element={<Home />}>
-            <Route index element={<Home />} />
-          </Route>
-        </Routes>
+        <AuthProvider>
+          <AppRouter />
+          <Toaster theme="dark" />
+        </AuthProvider>
       </BrowserRouter>
     </div>
   );

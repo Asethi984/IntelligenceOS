@@ -493,7 +493,7 @@ async def delete_note(note_id: str, user=Depends(get_current_user)):
 
 
 # ---------------- Thesis ----------------
-@api.get("/thesis/{ticker}")
+@api.get("/thesis/legacy/{ticker}")
 async def get_thesis(ticker: str, user=Depends(get_current_user)):
     theses = await db.theses.find({"user_id": user["user_id"], "ticker": ticker.upper()}, {"_id": 0}).sort("created_at", -1).to_list(20)
     return theses
@@ -505,7 +505,7 @@ async def create_thesis(body: ThesisBody, user=Depends(get_current_user)):
            "thesis": body.thesis, "evidence": body.evidence,
            "created_at": now_iso()}
     await db.theses.insert_one(doc)
-    return doc
+    return {k: v for k, v in doc.items() if k != "_id"}
 
 
 # ---------------- Alerts ----------------
@@ -521,7 +521,7 @@ async def create_alert(body: AlertRuleBody, user=Depends(get_current_user)):
          "ticker": body.ticker.upper(), "condition": body.condition,
          "value": body.value, "note": body.note, "created_at": now_iso(), "active": True}
     await db.alert_rules.insert_one(r)
-    return r
+    return {k: v for k, v in r.items() if k != "_id"}
 
 @api.delete("/alerts/{rule_id}")
 async def delete_alert(rule_id: str, user=Depends(get_current_user)):
@@ -935,7 +935,7 @@ async def create_journal(body: JournalEntryBody, user=Depends(get_current_user))
         "created_at": now_iso(), "resolved_at": None,
     }
     await db.journal_entries.insert_one(entry)
-    return entry
+    return {k: v for k, v in entry.items() if k != "_id"}
 
 @api.post("/journal/{entry_id}/postmortem")
 async def add_postmortem(entry_id: str, body: PostMortemBody, user=Depends(get_current_user)):

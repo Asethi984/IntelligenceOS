@@ -44,7 +44,7 @@ export default function CompanyDetail() {
     api.get(`/market/history/${ticker}?period=6mo`).then(r => setHist(r.data));
     api.get(`/company/${ticker}/financials`).then(r => setFin(r.data));
     api.get(`/company/${ticker}/news`).then(r => setNews(r.data));
-    api.get(`/thesis/${ticker}`).then(r => setThesis(r.data));
+    api.get(`/thesis/legacy/${ticker}`).then(r => setThesis(r.data)).catch(() => {});
   }, [ticker]);
 
   const runAgent = async (key) => {

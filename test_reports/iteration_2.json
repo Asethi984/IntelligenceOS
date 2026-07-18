@@ -1,0 +1,56 @@
+{
+  "summary": "Regression pass on IntelligenceOS backend after main-agent's 3 fixes. Full pytest suite: 39/39 PASSED in 64s. All 3 previously-critical bugs are confirmed fixed: (FIX 1) route ordering — GET /api/thesis/living now returns the caller's living_theses; ?ticker=AAPL filter works; legacy handler moved to /api/thesis/legacy/{ticker} and still responds 200. (FIX 2) POST /api/alerts returns 200 with a JSON-serialisable rule (no _id). (FIX 3) POST /api/journal returns 200 (no _id); downstream list, postmortem and /journal/analyze (GPT-5.2) all succeed. Living Thesis check flow verified via test_thesis_check_runs_ai — POST /thesis/living/{id}/check returns assumptions with status ∈ {intact,at_risk,broken} and non-empty reasoning. Emergent LLM (GPT-5.2) integration remains healthy across all 8 agent endpoints. yfinance flows all green in this run.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {
+        "endpoint": "POST /api/auth/oauth/session",
+        "issue": "Cookie set with samesite='none' and secure=True; only usable over HTTPS. Not exercised end-to-end (no live Google session). Bearer JWT fallback works — unchanged from iter_1."
+      },
+      {
+        "endpoint": "GET /api/market/quote/{ticker}",
+        "issue": "yfinance intermittently returns price=None under rate-limit. Endpoint still 200s; 60s TTL. Consider longer TTL / stale-while-revalidate."
+      }
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/conftest.py",
+    "/app/backend/tests/test_01_auth.py",
+    "/app/backend/tests/test_02_market.py",
+    "/app/backend/tests/test_03_company.py",
+    "/app/backend/tests/test_04_watchlist_portfolio.py",
+    "/app/backend/tests/test_05_ai_agents.py",
+    "/app/backend/tests/test_06_portfolio_intelligence.py",
+    "/app/backend/tests/test_07_living_thesis.py",
+    "/app/backend/tests/test_08_journal.py",
+    "/app/backend/tests/test_09_pipeline.py",
+    "/app/backend/tests/test_10_valuation_screener_docs_alerts_graph.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "No backend action items — all 3 iter_1 CRITICAL fixes verified. Safe to proceed with frontend integration verification if desired.",
+    "Optional: apply _strip_id helper across the codebase (create_thesis legacy is fixed, but a shared helper would prevent recurrence)."
+  ],
+  "critical_code_review_comments": [
+    "Route ordering fix is correct — legacy endpoint moved to /thesis/legacy/{ticker} so the more-specific /thesis/living now resolves first.",
+    "_id-strip pattern is now consistent in create_alert, create_journal, create_thesis (legacy). Consider extracting into `def _strip_id(d): return {k:v for k,v in d.items() if k != '_id'}` for reuse (still duplicated inline).",
+    "server.py is still ~1113 lines mixing auth/market/portfolio/thesis/journal/agents/RAG/graph — splitting into routers per domain remains recommended.",
+    "yfinance calls are still synchronous inside async endpoints; wrap in run_in_executor for production."
+  ],
+  "updated_files": [],
+  "success_rate": {
+    "backend": "100% (39/39 pytest passing)",
+    "frontend": "not tested (backend-only pass per request)"
+  },
+  "test_credentials": "Dynamic per-run: TEST_iops_<rand>@example.com / TestPass!234 (see /app/memory/test_credentials.md).",
+  "seed_data_creation": "Each pytest session creates a fresh user + 3 portfolio holdings (AAPL/MSFT/NVDA) + watchlist add (AMD) + Living Thesis v1+v2 for AAPL + 2 journal entries. All prefixed TEST_ where applicable.",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Backend is fully green (39/39). If a frontend/UI test pass is next, credentials are created dynamically via /api/auth/signup; the app returns {token, user} (JWT bearer). Focus areas for UI: Living Thesis list page (was previously empty because of the shadow bug — now fixed), Alerts creation form, and Decision Journal creation + /analyze view. All AI agent responses use GPT-5.2 via Emergent LLM key and take 5–30s per call — allow generous timeouts.",
+  "rca_of_the_issue": "N/A — regression pass confirmed all 3 fixes from iteration_1 are in place: (1) @api.get('/thesis/{ticker}') renamed to @api.get('/thesis/legacy/{ticker}') at server.py:496 so it no longer shadows the /thesis/living list route; (2)(3)(4) create_alert, create_journal, create_thesis all strip Mongo's _id from the response payload before returning."
+}

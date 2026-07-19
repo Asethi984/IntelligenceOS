@@ -172,6 +172,19 @@ async def signup(body: SignupBody, response: Response):
     }
     await db.users.insert_one(user)
     token = create_jwt(user_id)
+    # welcome email (async, non-blocking, no-op if RESEND_API_KEY missing)
+    try:
+        welcome_body = (
+            f"Hi {body.name.split()[0] if body.name else 'there'}, welcome aboard.<br/><br/>"
+            "Your IntelligenceOS terminal is ready. Start with the Command Center to see live markets, "
+            "then try running one of the 12 AI agents on a ticker you care about.<br/><br/>"
+            "You're on the Free plan — 10 AI queries and 5 additional tickers per list to get started."
+        )
+        html = _email_html("Welcome to IntelligenceOS", welcome_body,
+                           os.environ.get("APP_URL", ""), "Open your terminal" if os.environ.get("APP_URL") else None)
+        asyncio.create_task(_send_email(body.email, "Welcome to IntelligenceOS", html))
+    except Exception:
+        pass
     return {"token": token, "user": {"user_id": user_id, "email": body.email, "name": body.name, "role": "Owner", "plan": "Free"}}
 
 @api.post("/auth/login")
@@ -1650,7 +1663,63 @@ async def bulk_ratings(body: RatingsBody, user=Depends(get_current_user)):
     return {"ratings": rows, "as_of": now_iso()}
 
 
-# ---------------- Notifications (in-app + email via Resend) ----------------
+# ---------------- Email (Resend) ----------------
+def _email_html(title: str, body: str, cta_url: Optional[str] = None, cta_text: Optional[str] = None) -> str:
+    """Inline-CSS HTML template (email-client safe)."""
+    cta_block = ""
+    if cta_url and cta_text:
+        cta_block = (f'<tr><td style="padding: 24px 0 0 0;">'
+                     f'<a href="{cta_url}" style="background:#F97316;color:#000;padding:12px 24px;'
+                     f'text-decoration:none;border-radius:6px;font-family:system-ui,sans-serif;'
+                     f'font-size:14px;font-weight:600;display:inline-block;">{cta_text}</a>'
+                     f'</td></tr>')
+    return f"""<!DOCTYPE html>
+<html><body style="margin:0;padding:0;background:#090A0C;font-family:system-ui,-apple-system,sans-serif;">
+<table role="presentation" cellspacing="0" cellpadding="0" width="100%" style="padding:32px 0;">
+  <tr><td align="center">
+    <table role="presentation" cellspacing="0" cellpadding="0" width="600" style="max-width:600px;background:#121418;border:1px solid #22262E;border-radius:8px;">
+      <tr><td style="padding:24px 32px;border-bottom:1px solid #22262E;">
+        <div style="display:inline-block;width:24px;height:24px;background:#F97316;border-radius:4px;text-align:center;line-height:24px;font-weight:900;color:#000;">⚡</div>
+        <span style="margin-left:8px;color:#F3F4F6;font-weight:600;font-size:15px;">IntelligenceOS</span>
+      </td></tr>
+      <tr><td style="padding:32px;">
+        <h1 style="color:#F3F4F6;font-size:22px;font-weight:300;margin:0 0 16px 0;letter-spacing:-0.02em;">{title}</h1>
+        <div style="color:#9CA3AF;font-size:14px;line-height:1.6;">{body}</div>
+        <table role="presentation" cellspacing="0" cellpadding="0">{cta_block}</table>
+      </td></tr>
+      <tr><td style="padding:16px 32px;border-top:1px solid #22262E;color:#6B7280;font-size:11px;font-family:'Courier New',monospace;">
+        Not investment advice. <a href="#" style="color:#6B7280;">Manage preferences</a>
+      </td></tr>
+    </table>
+  </td></tr>
+</table></body></html>"""
+
+async def _send_email(to_email: str, subject: str, html: str) -> Dict[str, Any]:
+    """Non-blocking Resend send. Returns {sent:bool, id?, error?}."""
+    resend_key = os.environ.get("RESEND_API_KEY")
+    if not resend_key:
+        return {"sent": False, "error": "RESEND_API_KEY not configured"}
+    try:
+        import resend
+        resend.api_key = resend_key
+        params = {
+            "from": os.environ.get("RESEND_FROM", "IntelligenceOS <onboarding@resend.dev>"),
+            "to": [to_email], "subject": subject, "html": html,
+        }
+        result = await asyncio.to_thread(resend.Emails.send, params)
+        return {"sent": True, "id": result.get("id")}
+    except Exception as e:
+        logger.warning(f"resend send failed: {e}")
+        return {"sent": False, "error": str(e)[:200]}
+
+async def _get_email_prefs(user_id: str) -> Dict[str, Any]:
+    prefs = await db.email_prefs.find_one({"user_id": user_id}, {"_id": 0})
+    if not prefs:
+        prefs = {"user_id": user_id, "thesis_alerts": True, "weekly_digest": True,
+                 "product_updates": False, "created_at": now_iso()}
+        await db.email_prefs.insert_one(prefs)
+        prefs.pop("_id", None)
+    return prefs
 async def _create_notification(user_id: str, title: str, body: str, kind: str, meta: Dict[str, Any] = None):
     doc = {
         "notification_id": str(uuid.uuid4()), "user_id": user_id,
@@ -1658,23 +1727,21 @@ async def _create_notification(user_id: str, title: str, body: str, kind: str, m
         "meta": meta or {}, "read": False, "created_at": now_iso(),
     }
     await db.notifications.insert_one(doc)
-    # optional email
-    resend_key = os.environ.get("RESEND_API_KEY")
-    if resend_key:
-        try:
-            import resend
-            resend.api_key = resend_key
+    # Honor per-user email prefs
+    try:
+        prefs = await _get_email_prefs(user_id)
+        wants_email = prefs.get("thesis_alerts", True) if kind == "thesis_alert" else True
+        if wants_email:
             user = await db.users.find_one({"user_id": user_id}, {"_id": 0})
             if user and user.get("email"):
-                resend.Emails.send({
-                    "from": os.environ.get("RESEND_FROM", "IntelligenceOS <onboarding@resend.dev>"),
-                    "to": [user["email"]],
-                    "subject": title,
-                    "html": f"<h2>{title}</h2><p>{body}</p><p style='color:#888;font-size:12px'>— IntelligenceOS</p>",
-                })
-        except Exception as e:
-            logger.warning(f"resend email failed: {e}")
-    return doc
+                cta_url = None
+                if meta and meta.get("ticker"):
+                    cta_url = f"{os.environ.get('APP_URL', '')}/company/{meta['ticker']}"
+                html = _email_html(title, body, cta_url, "Open in IntelligenceOS" if cta_url else None)
+                await _send_email(user["email"], title, html)
+    except Exception as e:
+        logger.warning(f"email dispatch failed: {e}")
+    return {k: v for k, v in doc.items() if k != "_id"}
 
 @api.get("/notifications")
 async def list_notifications(unread_only: bool = False, user=Depends(get_current_user)):
@@ -1695,6 +1762,67 @@ async def mark_all_read(user=Depends(get_current_user)):
     await db.notifications.update_many({"user_id": user["user_id"], "read": False},
                                        {"$set": {"read": True, "read_at": now_iso()}})
     return {"ok": True}
+
+
+# ---------------- Email Preferences & Test/Digest ----------------
+class EmailPrefsBody(BaseModel):
+    thesis_alerts: Optional[bool] = None
+    weekly_digest: Optional[bool] = None
+    product_updates: Optional[bool] = None
+
+@api.get("/settings/email-prefs")
+async def get_email_prefs(user=Depends(get_current_user)):
+    prefs = await _get_email_prefs(user["user_id"])
+    return {**prefs, "resend_configured": bool(os.environ.get("RESEND_API_KEY"))}
+
+@api.put("/settings/email-prefs")
+async def update_email_prefs(body: EmailPrefsBody, user=Depends(get_current_user)):
+    update = {k: v for k, v in body.dict().items() if v is not None}
+    update["updated_at"] = now_iso()
+    await db.email_prefs.update_one({"user_id": user["user_id"]}, {"$set": update}, upsert=True)
+    return {"ok": True, **update}
+
+@api.post("/notifications/test-email")
+async def send_test_email(user=Depends(get_current_user)):
+    """Send a test email to the current user so they can verify delivery."""
+    body_html = ("This is a test email from IntelligenceOS. If you're reading this, "
+                 "notification emails are working — you'll receive alerts when your thesis "
+                 "assumptions become at-risk or broken.")
+    html = _email_html("Test email · IntelligenceOS", body_html,
+                       os.environ.get("APP_URL", ""), "Open dashboard" if os.environ.get("APP_URL") else None)
+    result = await _send_email(user["email"], "Test email · IntelligenceOS", html)
+    return result
+
+@api.post("/portfolio/digest/send")
+async def send_portfolio_digest(user=Depends(get_current_user)):
+    """Compose and send a weekly portfolio digest with AI-generated summary."""
+    prefs = await _get_email_prefs(user["user_id"])
+    if not prefs.get("weekly_digest", True):
+        return {"skipped": True, "reason": "user opted out"}
+    port = await get_portfolio(user)
+    brief = await portfolio_brief(user)
+    holdings_rows = "".join([
+        f'<tr><td style="padding:6px 8px;color:#F3F4F6;font-family:monospace;">{h["ticker"]}</td>'
+        f'<td style="padding:6px 8px;color:#9CA3AF;text-align:right;">${h["value"]:.0f}</td>'
+        f'<td style="padding:6px 8px;text-align:right;color:{"#22C55E" if h["gain"] >= 0 else "#EF4444"};font-family:monospace;">{h["gain_pct"]:+.2f}%</td></tr>'
+        for h in (port.get("holdings") or [])[:10]
+    ])
+    body_html = (
+        f'<div style="font-family:monospace;color:#6B7280;font-size:12px;margin-bottom:16px;">'
+        f'Portfolio value <strong style="color:#F3F4F6;">${port.get("total_value",0):,.0f}</strong> · '
+        f'total gain <strong style="color:{"#22C55E" if port.get("total_gain",0)>=0 else "#EF4444"};">'
+        f'{port.get("total_gain_pct",0):+.2f}%</strong> · health <strong style="color:#F97316;">'
+        f'{port.get("health_score",0)}/100</strong></div>'
+        f'<p style="color:#F3F4F6;">{brief.get("brief",{}).get("summary","No brief available.")}</p>'
+        f'<table role="presentation" cellspacing="0" cellpadding="0" width="100%" '
+        f'style="margin-top:16px;border-top:1px solid #22262E;">'
+        f'<tr><td colspan="3" style="padding-top:12px;color:#6B7280;font-size:10px;text-transform:uppercase;letter-spacing:0.15em;">Top Holdings</td></tr>'
+        f'{holdings_rows}</table>'
+    )
+    html = _email_html("Your weekly portfolio digest", body_html,
+                       os.environ.get("APP_URL", ""), "Open portfolio" if os.environ.get("APP_URL") else None)
+    result = await _send_email(user["email"], "Your weekly portfolio digest · IntelligenceOS", html)
+    return result
 
 
 app.include_router(api)

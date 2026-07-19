@@ -1,7 +1,7 @@
 import { useAuth } from "@/contexts/AuthContext";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
-import { Check, Clock, Zap } from "lucide-react";
+import { Check, Clock, Zap, Mail, Send } from "lucide-react";
 import { useEffect, useState } from "react";
 import api from "@/lib/api";
 
@@ -16,9 +16,15 @@ export default function Settings() {
   const { user } = useAuth();
   const [sched, setSched] = useState(null);
   const [triggering, setTriggering] = useState(false);
+  const [prefs, setPrefs] = useState(null);
+  const [testSending, setTestSending] = useState(false);
+  const [digestSending, setDigestSending] = useState(false);
   const upgrade = () => toast("Stripe checkout will activate once keys are configured.", { icon: "⚡" });
 
-  useEffect(() => { api.get("/scheduler/status").then(r => setSched(r.data)).catch(() => {}); }, []);
+  useEffect(() => {
+    api.get("/scheduler/status").then(r => setSched(r.data)).catch(() => {});
+    api.get("/settings/email-prefs").then(r => setPrefs(r.data)).catch(() => {});
+  }, []);
 
   const runNow = async () => {
     setTriggering(true);
@@ -27,6 +33,32 @@ export default function Settings() {
       toast.success(`Scanned ${data.scanned} theses · ${data.triggered.length} auto-checked`);
       const s = await api.get("/scheduler/status"); setSched(s.data);
     } finally { setTriggering(false); }
+  };
+
+  const updatePref = async (key, val) => {
+    const next = { ...prefs, [key]: val };
+    setPrefs(next);
+    try { await api.put("/settings/email-prefs", { [key]: val }); toast.success("Preferences saved"); }
+    catch { toast.error("Failed to save"); }
+  };
+
+  const sendTest = async () => {
+    setTestSending(true);
+    try {
+      const { data } = await api.post("/notifications/test-email");
+      if (data.sent) toast.success(`Test email sent to ${user?.email}`);
+      else toast.error(`Not sent: ${data.error || "unknown"}`);
+    } finally { setTestSending(false); }
+  };
+
+  const sendDigest = async () => {
+    setDigestSending(true);
+    try {
+      const { data } = await api.post("/portfolio/digest/send");
+      if (data.sent) toast.success("Weekly digest emailed");
+      else if (data.skipped) toast(`Skipped: ${data.reason}`);
+      else toast.error(`Not sent: ${data.error || "unknown"}`);
+    } finally { setDigestSending(false); }
   };
 
   return (
@@ -40,6 +72,44 @@ export default function Settings() {
           <div><div className="text-muted-foreground text-xs">Email</div><div className="font-mono">{user?.email}</div></div>
           <div><div className="text-muted-foreground text-xs">Role</div><div>{user?.role || "Owner"}</div></div>
           <div><div className="text-muted-foreground text-xs">Current Plan</div><div className="text-terminal">{user?.plan || "Free"}</div></div>
+        </div>
+      </div>
+
+      <div className="border border-line bg-panel rounded-md p-5" data-testid="email-prefs">
+        <div className="flex items-center justify-between mb-3">
+          <div className="flex items-center gap-2"><Mail className="w-4 h-4 text-terminal" /><div className="overline">Email Notifications · Resend</div></div>
+          <div className="flex items-center gap-2">
+            <span className={`text-[10px] font-mono px-2 py-0.5 rounded border ${prefs?.resend_configured ? "border-positive text-positive" : "border-warning text-warning"}`}>
+              {prefs?.resend_configured ? "CONFIGURED" : "NOT CONFIGURED"}
+            </span>
+          </div>
+        </div>
+        <div className="text-xs text-muted-foreground mb-4">
+          Email delivered by <span className="font-mono text-foreground">Resend</span> to <span className="font-mono">{user?.email}</span>.
+        </div>
+        <div className="space-y-2 mb-4">
+          {[
+            {k:"thesis_alerts",   l:"Thesis alerts",   d:"When AI auto-check flags an assumption as at-risk or broken"},
+            {k:"weekly_digest",   l:"Weekly digest",   d:"Portfolio performance and AI-generated summary every Monday"},
+            {k:"product_updates", l:"Product updates", d:"New agents, new features, changelog highlights"},
+          ].map(row => (
+            <label key={row.k} className="flex items-center justify-between py-2 border-b border-line last:border-0 cursor-pointer">
+              <div>
+                <div className="text-sm">{row.l}</div>
+                <div className="text-[11px] text-muted-foreground">{row.d}</div>
+              </div>
+              <input type="checkbox" checked={!!prefs?.[row.k]} onChange={(e) => updatePref(row.k, e.target.checked)}
+                className="w-4 h-4 accent-terminal" data-testid={`pref-${row.k}`} />
+            </label>
+          ))}
+        </div>
+        <div className="flex gap-2">
+          <Button size="sm" variant="outline" className="border-line h-8 text-xs" onClick={sendTest} disabled={testSending || !prefs?.resend_configured} data-testid="send-test-email-btn">
+            <Send className="w-3 h-3 mr-1" /> {testSending ? "Sending…" : "Send test email"}
+          </Button>
+          <Button size="sm" variant="outline" className="border-line h-8 text-xs" onClick={sendDigest} disabled={digestSending || !prefs?.resend_configured} data-testid="send-digest-btn">
+            <Mail className="w-3 h-3 mr-1" /> {digestSending ? "Sending…" : "Send weekly digest now"}
+          </Button>
         </div>
       </div>
 

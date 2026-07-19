@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useNavigate, Link } from "react-router-dom";
 import { useAuth } from "@/contexts/AuthContext";
 import { Button } from "@/components/ui/button";
@@ -12,9 +12,12 @@ export default function Login({ mode = "login" }) {
   const [password, setPassword] = useState("");
   const [name, setName] = useState("");
   const [busy, setBusy] = useState(false);
-  const { login, signup } = useAuth();
+  const { login, signup, user } = useAuth();
   const nav = useNavigate();
   const isSignup = mode === "signup";
+
+  // If already logged in, redirect to app
+  useEffect(() => { if (user) nav("/", { replace: true }); }, [user, nav]);
 
   const submit = async (e) => {
     e.preventDefault();

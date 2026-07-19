@@ -1,0 +1,52 @@
+{
+  "summary": "IntelligenceOS Wave-5 bug-batch backend verification: 119/120 pytest passing (99.2%). Added test_23_news_relevance.py (news filter for AAPL+NVDA) and test_24_landing_public.py (auth/me 401 + signup shape + login flow + duplicate signup + business summary for AAPL/MSFT/NVDA/TSLA + bad-ticker no-500). All 12 bug-batch items in scope verified: (1) LANDING PAGE - backend /api/auth/me correctly returns 401 for unauth. (2) SIGNUP - returns 200 token+user with user_id/email/name, role=Owner, plan=Free, no _id leak, JWT works against /me. (3) LOGIN - valid=200, wrong pw=401, dup=400 'already registered'. (4) /api/auth/me with Bearer OK. (5) NEWS RELEVANCE - AAPL/NVDA titles+links contain aapl/apple, nvda/nvidia; zero irrelevant slip-through; len 1..10. (6) BUSINESS SUMMARY - AAPL/MSFT/NVDA/TSLA all non-empty; bad ticker returns 200 not 500. (7) DOCUMENTS CONTRADICTION regression - retrieved>=2 with 2 uploaded contradictory .txt. (8) PORTFOLIO+SCREENER shapes intact via test_04 + test_10. (9) SUPERVISOR - celery_worker + celery_beat both RUNNING per supervisorctl. (10) RESEND - RESEND_API_KEY set in .env; test_17 notifications endpoints continue to pass (endpoint does not 500). (11) REGRESSION - 119/120 tests pass (only failure is test_11_scheduler::test_scheduler_status_has_job — see below).\n\nBLOCKED: Redis daemon is not actually running in this container (redis-server binary not installed). Supervisor shows celery_worker+celery_beat RUNNING but both are stuck in retry loops with 'Cannot assign requested address' to localhost:6379 — see /var/log/supervisor/celery_beat.err.log. Because REDIS_URL is set, backend hands scheduling off to Celery ('scheduler: Celery beat expected to handle scheduling (REDIS_URL set)') so APScheduler no longer registers thesis_auto_recheck — /api/scheduler/status returns jobs=[] and test_11_scheduler::test_scheduler_status_has_job fails. Net effect: scheduled thesis re-check is NOT actually scheduled anywhere in this env. Manual /scheduler/run-now still works.",
+  "backend_issues": {
+    "critical": [
+      {
+        "endpoint": "/api/scheduler/status + celery beat",
+        "issue": "blocked: needs-redis-daemon. REDIS_URL=redis://localhost:6379/0 is set but no redis-server is installed/listening. Backend hands scheduling off to Celery when REDIS_URL is present; supervisor shows celery_worker+celery_beat RUNNING but both loop with 'Cannot assign requested address' — scheduling is broken. APScheduler is disabled (test_11_scheduler::test_scheduler_status_has_job fails: jobs=[]).",
+        "priority": "HIGH"
+      }
+    ],
+    "minor": [
+      {"endpoint": "POST /api/notifications/{id}/read", "issue": "carry-over: still returns {ok:true} when id does not exist"},
+      {"endpoint": "POST /api/watchlist/remove", "issue": "carry-over: silent no-op when ticker only in default_tickers"},
+      {"endpoint": "POST /api/documents/contradiction", "issue": "carry-over: ticker-less call scans all user chunks"},
+      {"endpoint": "GET /api/company/{ticker}/news", "issue": "Relevance filter uses only the FIRST token of company name (split(' ')[0]) — e.g. company_name='Alphabet Inc.' → filter on 'alphabet'. Works for AAPL/NVDA/MSFT/TSLA but weak for hyphenated / multi-word companies (e.g. 'JPMorgan Chase' → 'jpmorgan'). Consider indexing on any-token match."}
+    ]
+  },
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_23_news_relevance.py",
+    "/app/backend/tests/test_24_landing_public.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "HIGH: Install and run redis-server as a supervisor process (or point REDIS_URL at an external Redis). Otherwise unset REDIS_URL so backend falls back to APScheduler. Current state = no scheduler is actually running (celery beat can't connect, APScheduler is disabled).",
+    "OPTIONAL: Update test_11_scheduler::test_scheduler_status_has_job to conditionally skip when REDIS_URL is set (Celery-beat mode), and add a new test that checks Celery beat health when USE_CELERY_BEAT=1.",
+    "OPTIONAL: News relevance filter — match ANY token of company_name, not just the first, to handle multi-word issuers robustly."
+  ],
+  "critical_code_review_comments": [
+    "server.py:1715 uses `os.environ.get('REDIS_URL') and os.environ.get('USE_CELERY_BEAT','1')=='1'` to gate APScheduler off. This is a boolean latch, not a health probe — if Redis is unreachable the app silently loses scheduling. Consider ping'ing Redis at startup and only disabling APScheduler on successful ping.",
+    "celery_worker + celery_beat supervisor processes retry indefinitely (100 tries) on connection failure, spamming err.log. Add a bounded retry + autorestart=false when Redis truly unreachable, or move behind a healthcheck.",
+    "company_news relevance filter (server.py:377-384) uses only the first token of company name via `.split(' ')[0]` — weak for issuers like 'JPMorgan Chase & Co.' (works for AAPL/MSFT/NVDA/TSLA in the request but brittle).",
+    "server.py is now 1735 lines — repeat feedback from iteration_5: domain-router split urgent.",
+    "The 'fallback branch' in company_news (return top 5 unfiltered) can smuggle irrelevant items back in when the filter is over-strict. Consider returning [] with a flag `filter_applied:true` and let the UI show 'no ticker-relevant news' instead of showing generic market items.",
+    "RESEND_FROM uses onboarding@resend.dev — fine for sandbox but Resend rejects sends to non-verified recipients on this from-address. Verify a real domain before prod.",
+    "APScheduler branch is a fallback but still initializes and imports the whole module even when disabled — no harm but dead code path in celery-beat mode."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_23_news_relevance.py (new)",
+    "/app/backend/tests/test_24_landing_public.py (new)"
+  ],
+  "success_rate": {
+    "backend": "99.2% (119/120 pytest; 1 fail is real scheduler regression due to broken Redis)",
+    "frontend": "not tested (backend-only scope per request)"
+  },
+  "test_credentials": "Dynamic per-run via /api/auth/signup — session user TEST_iops_<rand>@example.com / TestPass!234 (see conftest.py). scoretest@int.os / password123 from /app/memory/test_credentials.md was NOT used since tests provision fresh isolated users.",
+  "seed_data_creation": "test_23 no seed. test_24 creates 2 fresh users per run (TEST_land_* + TEST_land2_*) for signup+login+duplicate flow. All previous seed data unchanged.",
+  "retest_needed": true,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Backend at 119/120 (99.2%). Only failure: test_11_scheduler::test_scheduler_status_has_job — RCA is Redis-not-installed + Celery-beat mode disables APScheduler. NEW modules test_23 (news_relevance) + test_24 (landing_public / auth+business summary) all pass. Wave-5 changes verified: (a) /api/auth/me correctly 401 for unauth (Landing route is client-side, backend contract intact); (b) Signup returns user_id/email/name/role=Owner/plan=Free, no _id, JWT works against /me; (c) Login OK / wrong pw 401 / duplicate 400 'already registered'; (d) News relevance filter drops non-ticker items — verified for AAPL+NVDA, len<=10; (e) Business summary present for AAPL+MSFT+NVDA+TSLA; bad ticker returns 200 without 500; (f) Contradiction regression retrieved>=2 still passing (test_22::test_bug4). yfinance is stable this run (no rate limit hit). Emergent LLM (gpt-5.4) is healthy — all AI tests pass and _meta.model=='gpt-5.4' confirmed. NEXT AGENT should focus on the frontend Landing page (Playwright: unauth → /welcome, no redirect loop), Portfolio/Screener UI improvements verification, and re-check scheduler after Redis is installed.",
+  "rca_of_the_issue": "test_11_scheduler::test_scheduler_status_has_job FAILURE — server.py:1715 gates APScheduler off when REDIS_URL is set (defers to Celery beat). But redis-server is not installed/running in this container: `redis-cli` binary missing; python `redis.Redis.from_url('redis://localhost:6379/0').ping()` → OSError 99 'Cannot assign requested address'; celery beat + worker both stuck in retry loops per /var/log/supervisor/celery_beat.err.log. So scheduling is broken in TWO ways simultaneously: APScheduler is disabled by the env gate, Celery beat cannot reach Redis. Fix options (main agent): (1) install redis-server via `apt-get install -y redis-server` + supervisor conf, or (2) remove REDIS_URL from /app/backend/.env so backend falls back to APScheduler until Redis is provisioned, or (3) implement a Redis-ping-at-startup fallback so APScheduler kicks in when Celery cannot reach Redis. Reproduce: `sudo supervisorctl status | grep celery` shows RUNNING; `tail /var/log/supervisor/celery_beat.err.log` shows connect retries; `curl -H'Authorization: Bearer $T' $URL/api/scheduler/status` returns jobs=[]."
+}

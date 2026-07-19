@@ -17,9 +17,12 @@ api.interceptors.request.use((config) => {
 api.interceptors.response.use(
   (r) => r,
   (err) => {
-    if (err.response?.status === 401 && !window.location.pathname.startsWith("/login") && !window.location.pathname.startsWith("/signup") && window.location.pathname !== "/") {
+    const p = window.location.pathname;
+    const publicRoutes = ["/welcome", "/login", "/signup", "/auth/callback"];
+    const isPublic = publicRoutes.some((route) => p.startsWith(route));
+    if (err.response?.status === 401 && !isPublic) {
       localStorage.removeItem("token");
-      window.location.href = "/login";
+      window.location.href = "/welcome";
     }
     return Promise.reject(err);
   }

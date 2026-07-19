@@ -6,7 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { toast } from "sonner";
-import { Plus, Trash2, Activity } from "lucide-react";
+import { Plus, Trash2, Activity, TrendingUp, Briefcase } from "lucide-react";
 import { PieChart, Pie, Cell, ResponsiveContainer } from "recharts";
 import PortfolioIntelligence from "@/components/PortfolioIntelligence";
 
@@ -22,10 +22,12 @@ export default function Portfolio() {
   const [shares, setShares] = useState("");
   const [cost, setCost] = useState("");
   const [open, setOpen] = useState(false);
+  const [sort, setSort] = useState({ key: "value", desc: true });
   const nav = useNavigate();
 
   const load = () => api.get("/portfolio").then(r => setPort(r.data));
   useEffect(() => { load(); }, []);
+  const setSortKey = (k) => setSort({ key: k, desc: sort.key === k ? !sort.desc : true });
 
   const add = async () => {
     if (!ticker || !shares || !cost) return toast.error("All fields required");
@@ -90,15 +92,32 @@ export default function Portfolio() {
 
       <div className="grid grid-cols-12 gap-4">
         <div className="col-span-8 border border-line bg-panel rounded-md overflow-hidden">
-          <div className="overline px-4 py-2.5 border-b border-line">Holdings</div>
+          <div className="flex items-center justify-between px-4 py-2.5 border-b border-line">
+            <div className="overline">Holdings ({(port?.holdings || []).length})</div>
+            <div className="text-[10px] font-mono text-muted-foreground">Click column to sort · Click row to open company</div>
+          </div>
           <table className="w-full text-xs">
             <thead>
               <tr className="text-muted-foreground border-b border-line">
-                {["Ticker","Shares","Cost","Price","Value","Gain","Alloc","Today",""].map(h => <th key={h} className="text-right font-normal overline px-3 py-2">{h}</th>)}
+                {[
+                  {k:"ticker",l:"Ticker"},{k:"shares",l:"Shares"},{k:"cost_basis",l:"Cost"},
+                  {k:"price",l:"Price"},{k:"value",l:"Value"},{k:"gain_pct",l:"Gain"},
+                  {k:"allocation",l:"Alloc"},{k:"change_pct",l:"Today"}
+                ].map(c => (
+                  <th key={c.k} onClick={() => setSortKey(c.k)}
+                    className="text-right font-normal overline px-3 py-2 cursor-pointer hover:text-terminal">
+                    {c.l}{sort.key === c.k && <span className="ml-1">{sort.desc ? "↓" : "↑"}</span>}
+                  </th>
+                ))}
+                <th></th>
               </tr>
             </thead>
             <tbody>
-              {(port?.holdings || []).map(h => (
+              {[...(port?.holdings || [])].sort((a,b) => {
+                const va = a[sort.key] ?? -Infinity, vb = b[sort.key] ?? -Infinity;
+                if (typeof va === "string") return sort.desc ? vb.localeCompare(va) : va.localeCompare(vb);
+                return sort.desc ? vb - va : va - vb;
+              }).map(h => (
                 <tr key={h.holding_id} className="border-b border-line hover:bg-surface cursor-pointer" onClick={() => nav(`/company/${h.ticker}`)}>
                   <td className="px-3 py-2 font-mono text-left">{h.ticker}</td>
                   <td className="px-3 py-2 font-mono text-right">{fmt(h.shares, 0)}</td>
@@ -112,7 +131,14 @@ export default function Portfolio() {
                 </tr>
               ))}
               {(port?.holdings || []).length === 0 && (
-                <tr><td colSpan={9} className="text-center text-muted-foreground py-8">No holdings. Add your first one.</td></tr>
+                <tr><td colSpan={9} className="py-10">
+                  <div className="text-center">
+                    <Briefcase className="w-8 h-8 text-muted-foreground mx-auto mb-3" />
+                    <div className="text-sm mb-1">No holdings yet</div>
+                    <div className="text-xs text-muted-foreground mb-4">Add your first position to unlock health score, AI daily brief, hidden connections, and macro exposure.</div>
+                    <Button size="sm" className="bg-terminal text-black hover:bg-terminal/90" onClick={() => setOpen(true)}><Plus className="w-3.5 h-3.5 mr-1" /> Add your first holding</Button>
+                  </div>
+                </td></tr>
               )}
             </tbody>
           </table>

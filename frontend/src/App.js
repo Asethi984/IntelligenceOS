@@ -24,6 +24,7 @@ import Journal from "@/pages/Journal";
 import Timeline from "@/pages/Timeline";
 import Board from "@/pages/Board";
 import Ratings from "@/pages/Ratings";
+import Landing from "@/pages/Landing";
 
 function AppRouter() {
   const location = useLocation();
@@ -32,6 +33,7 @@ function AppRouter() {
   }
   return (
     <Routes>
+      <Route path="/welcome" element={<Landing />} />
       <Route path="/login" element={<Login mode="login" />} />
       <Route path="/signup" element={<Login mode="signup" />} />
       <Route path="/auth/callback" element={<AuthCallback />} />

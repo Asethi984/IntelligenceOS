@@ -2,10 +2,12 @@ import { useEffect, useState } from "react";
 import api from "@/lib/api";
 import { useNavigate } from "react-router-dom";
 import AIPanel from "@/components/AIPanel";
-import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { LineChart, Line, ResponsiveContainer, XAxis, YAxis, Tooltip } from "recharts";
-import { TrendingUp, TrendingDown, Activity, Calendar, ArrowUpRight } from "lucide-react";
+import { Activity, ArrowUpRight, Plus } from "lucide-react";
+import { toast } from "sonner";
 
 const fmt = (n, d = 2) => (n == null ? "—" : Number(n).toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d }));
 const pctColor = (n) => (n > 0 ? "text-positive" : n < 0 ? "text-negative" : "text-muted-foreground");
@@ -28,11 +30,16 @@ export default function CommandCenter() {
   const [brief, setBrief] = useState(null);
   const [briefLoading, setBriefLoading] = useState(false);
   const [spy, setSpy] = useState([]);
+  const [addOpen, setAddOpen] = useState(false);
+  const [assetClass, setAssetClass] = useState("stocks");
+  const [addTicker, setAddTicker] = useState("");
   const nav = useNavigate();
+
+  const loadWatchlist = () => api.get("/watchlist").then(r => setWatchlist(r.data)).catch(() => {});
 
   useEffect(() => {
     api.get("/market/overview").then(r => setOverview(r.data)).catch(() => {});
-    api.get("/watchlist").then(r => setWatchlist(r.data)).catch(() => {});
+    loadWatchlist();
     api.get("/market/history/^GSPC?period=1mo").then(r => setSpy(r.data)).catch(() => {});
   }, []);
 
@@ -41,7 +48,19 @@ export default function CommandCenter() {
     try {
       const { data } = await api.get("/market/brief");
       setBrief(data.brief);
-    } finally { setBriefLoading(false); }
+    } catch { toast.error("Failed to generate brief"); }
+    finally { setBriefLoading(false); }
+  };
+
+  const addStock = async () => {
+    if (!addTicker.trim()) return;
+    try {
+      await api.post("/watchlist/add", { asset_class: assetClass, ticker: addTicker.trim().toUpperCase() });
+      toast.success(`${addTicker.toUpperCase()} added to ${assetClass}`);
+      setAddOpen(false); setAddTicker(""); loadWatchlist();
+    } catch (e) {
+      toast.error(e.response?.data?.detail || "Failed to add");
+    }
   };
 
   return (
@@ -51,9 +70,31 @@ export default function CommandCenter() {
           <h1 className="text-3xl font-light tracking-tighter">Command Center</h1>
           <p className="text-xs text-muted-foreground mt-1 font-mono">Real-time market intelligence · updated {new Date().toLocaleTimeString()}</p>
         </div>
-        <Button size="sm" className="bg-terminal text-black hover:bg-terminal/90" onClick={generateBrief} data-testid="generate-brief-btn">
-          <Activity className="w-3.5 h-3.5 mr-1.5" /> Generate AI Brief
-        </Button>
+        <div className="flex gap-2">
+          <Dialog open={addOpen} onOpenChange={setAddOpen}>
+            <DialogTrigger asChild>
+              <Button size="sm" variant="outline" className="border-line" data-testid="cc-add-stock-btn">
+                <Plus className="w-3.5 h-3.5 mr-1" /> Add Ticker
+              </Button>
+            </DialogTrigger>
+            <DialogContent className="bg-panel border-line">
+              <DialogHeader><DialogTitle>Add Ticker to Watchlist</DialogTitle></DialogHeader>
+              <div className="space-y-3">
+                <div className="grid grid-cols-3 gap-2">
+                  {[["stocks","Stocks"],["crypto","Crypto"],["etfs","ETFs"]].map(([k,l]) => (
+                    <button key={k} onClick={() => setAssetClass(k)} data-testid={`cc-asset-${k}`}
+                      className={`px-3 py-2 rounded border text-xs uppercase tracking-widest font-mono ${assetClass === k ? "border-terminal text-terminal" : "border-line text-muted-foreground hover:text-foreground"}`}>{l}</button>
+                  ))}
+                </div>
+                <Input placeholder={assetClass === "crypto" ? "BTC-USD" : "AAPL"} value={addTicker} onChange={(e) => setAddTicker(e.target.value.toUpperCase())} className="bg-base border-line font-mono" data-testid="cc-add-input" onKeyDown={(e) => { if (e.key === "Enter") addStock(); }} />
+                <Button className="w-full bg-terminal text-black hover:bg-terminal/90" onClick={addStock} data-testid="cc-add-submit">Add</Button>
+              </div>
+            </DialogContent>
+          </Dialog>
+          <Button size="sm" className="bg-terminal text-black hover:bg-terminal/90" onClick={generateBrief} data-testid="generate-brief-btn">
+            <Activity className="w-3.5 h-3.5 mr-1.5" /> Generate AI Brief
+          </Button>
+        </div>
       </div>
 
       {/* Indices strip */}
@@ -101,7 +142,12 @@ export default function CommandCenter() {
         </Widget>
 
         {/* Watchlist */}
-        <Widget title="Watchlist Intelligence" className="col-span-7">
+        <Widget title="Watchlist Intelligence" className="col-span-7"
+          right={
+            <button onClick={() => setAddOpen(true)} className="text-[10px] font-mono text-muted-foreground hover:text-terminal flex items-center gap-1" data-testid="cc-wl-add-btn">
+              <Plus className="w-3 h-3" /> Add
+            </button>
+          }>
           <table className="w-full text-xs">
             <thead>
               <tr className="text-muted-foreground border-b border-line">
@@ -123,18 +169,23 @@ export default function CommandCenter() {
                   <td className="text-right"><ArrowUpRight className="w-3 h-3 text-muted-foreground inline" /></td>
                 </tr>
               ))}
+              {(watchlist?.quotes || []).length === 0 && (
+                <tr><td colSpan={5} className="text-center text-muted-foreground py-4">No tickers. Click Add.</td></tr>
+              )}
             </tbody>
           </table>
         </Widget>
 
         {/* AI Brief */}
         <div className="col-span-5">
-          <AIPanel result={brief} loading={briefLoading} title="AI Market Brief" />
-          {!brief && !briefLoading && (
+          {(brief || briefLoading) ? (
+            <AIPanel result={brief} loading={briefLoading} title="AI Market Brief" />
+          ) : (
             <div className="border border-line bg-panel rounded-md p-6 text-center">
               <Activity className="w-8 h-8 text-terminal mx-auto mb-3" />
               <div className="text-sm mb-1">No brief generated yet</div>
-              <div className="text-xs text-muted-foreground mb-4">Click "Generate AI Brief" to synthesize today's market context.</div>
+              <div className="text-xs text-muted-foreground mb-4">Click Generate AI Brief to synthesize today&apos;s market context via GPT-5.4.</div>
+              <Button size="sm" className="bg-terminal text-black hover:bg-terminal/90" onClick={generateBrief} data-testid="cc-brief-cta">Generate Brief</Button>
             </div>
           )}
         </div>

@@ -18,7 +18,11 @@ body {
   font-size: 14px;
 }
 
-.font-mono { font-family: 'JetBrains Mono', ui-monospace, monospace; }
+textarea, select, input {
+  color: #F3F4F6;
+  background-color: transparent;
+}
+textarea::placeholder, input::placeholder { color: #6B7280; }
 
 @layer base {
   :root {

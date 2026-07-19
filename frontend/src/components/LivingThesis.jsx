@@ -5,6 +5,7 @@ import { Input } from "@/components/ui/input";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { toast } from "sonner";
 import { Plus, Zap, ShieldCheck, ShieldAlert, ShieldX, GitBranch, Trash2 } from "lucide-react";
+import AIAssist from "@/components/AIAssist";
 
 const STATUS_META = {
   intact: { icon: ShieldCheck, color: "text-positive border-positive", label: "INTACT" },
@@ -42,7 +43,10 @@ export default function LivingThesis({ ticker }) {
     }
   }, [active?.thesis_id]);
 
+  const [isVersioning, setIsVersioning] = useState(false);
+
   const resetForm = (parent = null) => {
+    setIsVersioning(!!parent);
     setStance(parent?.stance || "bull"); setHeadline(parent?.headline || ""); setNarrative(parent?.narrative || "");
     setAssumptions(parent?.assumptions?.map(a => ({ text: a.text, kind: a.kind })) || [{ text: "", kind: "business" }]);
     setCatalysts(parent?.catalysts?.length ? parent.catalysts : [""]);
@@ -118,7 +122,8 @@ export default function LivingThesis({ ticker }) {
                   ))}
                 </div>
                 <Input placeholder="Headline (one line)" value={headline} onChange={(e) => setHeadline(e.target.value)} className="bg-base border-line" data-testid="thesis-headline" />
-                <textarea placeholder="Narrative (2-4 paragraphs)" value={narrative} onChange={(e) => setNarrative(e.target.value)} rows={4} className="w-full bg-base border border-line rounded-md p-2 text-sm resize-none" data-testid="thesis-narrative" />
+                <textarea placeholder="Narrative (2-4 paragraphs)" value={narrative} onChange={(e) => setNarrative(e.target.value)} rows={4} className="w-full bg-base border border-line rounded-md p-2 text-sm resize-none text-foreground" data-testid="thesis-narrative" />
+                <AIAssist contextType="thesis" text={narrative} onApply={setNarrative} ticker={ticker} label="AI · Improve narrative" />
 
                 <div>
                   <div className="overline mb-2">Assumptions</div>
@@ -163,8 +168,8 @@ export default function LivingThesis({ ticker }) {
                   <div><div className="overline mb-1">Horizon (mo)</div><Input type="number" value={horizon} onChange={(e) => setHorizon(e.target.value)} className="bg-base border-line font-mono" /></div>
                 </div>
 
-                <Button className="w-full bg-terminal text-black hover:bg-terminal/90" onClick={() => submit(active?.thesis_id && open ? null : null)} data-testid="save-living-thesis-btn">
-                  Save Thesis
+                <Button className="w-full bg-terminal text-black hover:bg-terminal/90" onClick={() => submit(isVersioning ? active?.thesis_id : null)} data-testid="save-living-thesis-btn">
+                  {isVersioning ? "Save New Version" : "Save Thesis"}
                 </Button>
               </div>
             </DialogContent>

@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { toast } from "sonner";
 import { Plus, Trash2 } from "lucide-react";
+import AIAssist from "@/components/AIAssist";
 
 export default function Research() {
   const [notes, setNotes] = useState([]);
@@ -57,8 +58,11 @@ export default function Research() {
         </div>
         <div className="col-span-9 border border-line bg-panel rounded-md p-4">
           <Input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Note title" className="bg-transparent border-0 text-xl font-light tracking-tight focus-visible:ring-0 mb-3" data-testid="note-title" />
-          <textarea value={content} onChange={(e) => setContent(e.target.value)} rows={22} data-testid="note-content"
-            className="w-full bg-base border border-line rounded-md p-3 text-sm font-mono resize-none" placeholder="Write your research…" />
+          <textarea value={content} onChange={(e) => setContent(e.target.value)} rows={20} data-testid="note-content"
+            className="w-full bg-base border border-line rounded-md p-3 text-sm font-mono resize-none text-foreground" placeholder="Write your research…" />
+          <div className="mt-3">
+            <AIAssist contextType="note" text={content} onApply={setContent} label="AI · Rewrite note" />
+          </div>
           <div className="mt-3 flex justify-end">
             <Button size="sm" className="bg-terminal text-black hover:bg-terminal/90" onClick={save} data-testid="save-note-btn">Save</Button>
           </div>

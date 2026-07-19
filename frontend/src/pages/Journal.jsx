@@ -7,6 +7,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { toast } from "sonner";
 import { Plus, Trash2, Brain, Sparkles } from "lucide-react";
+import AIAssist from "@/components/AIAssist";
 
 const ACTION_COLORS = { buy: "text-positive border-positive", sell: "text-negative border-negative", hold: "text-warning border-warning", watch: "text-insight border-insight" };
 
@@ -94,11 +95,13 @@ export default function Journal() {
                 </div>
                 <div>
                   <div className="overline mb-1">Why? (decision reason)</div>
-                  <textarea value={reason} onChange={(e) => setReason(e.target.value)} rows={3} className="w-full bg-base border border-line rounded-md p-2 text-sm font-mono resize-none" data-testid="dj-reason" />
+                  <textarea value={reason} onChange={(e) => setReason(e.target.value)} rows={3} className="w-full bg-base border border-line rounded-md p-2 text-sm font-mono resize-none text-foreground" data-testid="dj-reason" />
+                  <div className="mt-2"><AIAssist contextType="journal_reason" text={reason} onApply={setReason} ticker={ticker} /></div>
                 </div>
                 <div>
                   <div className="overline mb-1">Expected outcome</div>
-                  <textarea value={expected} onChange={(e) => setExpected(e.target.value)} rows={2} className="w-full bg-base border border-line rounded-md p-2 text-sm font-mono resize-none" data-testid="dj-expected" />
+                  <textarea value={expected} onChange={(e) => setExpected(e.target.value)} rows={2} className="w-full bg-base border border-line rounded-md p-2 text-sm font-mono resize-none text-foreground" data-testid="dj-expected" />
+                  <div className="mt-2"><AIAssist contextType="journal_expected" text={expected} onApply={setExpected} ticker={ticker} /></div>
                 </div>
                 <div className="grid grid-cols-2 gap-2">
                   <Input type="number" placeholder="Horizon (months)" value={horizon} onChange={(e) => setHorizon(e.target.value)} className="bg-base border-line font-mono" />

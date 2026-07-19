@@ -31,6 +31,7 @@ MONGO_URL = os.environ['MONGO_URL']
 DB_NAME = os.environ['DB_NAME']
 JWT_SECRET = os.environ['JWT_SECRET']
 EMERGENT_LLM_KEY = os.environ.get('EMERGENT_LLM_KEY', '')
+LLM_MODEL = os.environ.get('LLM_MODEL', 'gpt-5.4')
 
 client = AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
@@ -605,36 +606,104 @@ AGENT_SYSTEM = {
     "assumption_check": "You are an assumption auditor. Given a thesis assumption and current data, determine if it is INTACT, AT_RISK, or BROKEN with reasoning.",
     "hidden_connections": "You are a portfolio pattern analyst. Given holdings, identify hidden thesis clusters (e.g., AI-infrastructure, rate-sensitive, China-exposed) that go beyond sector labels.",
     "macro_exposure": "You are a macro exposure analyst. For a given portfolio, quantify exposure (0-100) to: interest rates, oil, China, AI, semiconductors, inflation, housing, defense, consumer.",
+    "note_assist": "You are an investment writing assistant. Rewrite or generate concise, analytical text for research notes, theses, journal entries, catalysts, risks, or assumptions. Match the requested tone. Return the rewritten text in 'summary'.",
 }
+
+# Per-agent runtime configuration (each agent is genuinely different, not just prompt)
+AGENT_CONFIG = {
+    "research":         {"model": LLM_MODEL,  "temperature": 0.4, "max_evidence": 6},
+    "financial":        {"model": LLM_MODEL,  "temperature": 0.2, "max_evidence": 8},
+    "news":             {"model": LLM_MODEL,  "temperature": 0.5, "max_evidence": 5},
+    "competitor":       {"model": LLM_MODEL,  "temperature": 0.4, "max_evidence": 6},
+    "risk":             {"model": LLM_MODEL,  "temperature": 0.3, "max_evidence": 8},
+    "valuation":        {"model": LLM_MODEL,  "temperature": 0.2, "max_evidence": 6},
+    "macro":            {"model": LLM_MODEL,  "temperature": 0.5, "max_evidence": 5},
+    "market_brief":     {"model": LLM_MODEL,  "temperature": 0.6, "max_evidence": 5},
+    "portfolio_brief":  {"model": LLM_MODEL,  "temperature": 0.4, "max_evidence": 5},
+    "contradiction":    {"model": LLM_MODEL,  "temperature": 0.2, "max_evidence": 10},
+    "management":       {"model": LLM_MODEL,  "temperature": 0.3, "max_evidence": 6},
+    "materiality":      {"model": LLM_MODEL,  "temperature": 0.3, "max_evidence": 4},
+    "earnings_diff":    {"model": LLM_MODEL,  "temperature": 0.2, "max_evidence": 8},
+    "bias":             {"model": LLM_MODEL,  "temperature": 0.6, "max_evidence": 6},
+    "assumption_check": {"model": LLM_MODEL,  "temperature": 0.2, "max_evidence": 4},
+    "hidden_connections":{"model": LLM_MODEL, "temperature": 0.5, "max_evidence": 6},
+    "macro_exposure":   {"model": LLM_MODEL,  "temperature": 0.3, "max_evidence": 9},
+    "note_assist":      {"model": LLM_MODEL,  "temperature": 0.6, "max_evidence": 0},
+}
+
+async def _build_agent_context(agent_key: str, ticker: Optional[str], base_ctx: str) -> str:
+    """Each agent gets a DIFFERENT enrichment of the context. This is where agents diverge in behavior."""
+    if not ticker:
+        return base_ctx
+    T = ticker.upper()
+    parts = [base_ctx] if base_ctx else []
+    try:
+        if agent_key == "financial" or agent_key == "earnings_diff":
+            tk = yf.Ticker(T)
+            fin = tk.financials.T if tk.financials is not None else None
+            if fin is not None and not fin.empty:
+                latest = fin.iloc[0].to_dict()
+                parts.append("Latest income statement: " + ", ".join(
+                    [f"{k}={v:.0f}" for k, v in list(latest.items())[:8] if isinstance(v, (int, float)) and v == v]))
+        elif agent_key == "competitor":
+            peers_map = {"AAPL":["MSFT","GOOGL"],"MSFT":["AAPL","GOOGL","ORCL"],"NVDA":["AMD","INTC","AVGO"],"TSLA":["F","GM","RIVN"],"META":["GOOGL","SNAP","PINS"],"AMZN":["WMT","MSFT","GOOGL"]}
+            peers = peers_map.get(T, [])
+            if peers:
+                parts.append(f"Peers to compare: {', '.join(peers)}")
+                for p in peers[:3]:
+                    q = _fetch_quote(p)
+                    parts.append(f"  {p}: ${q.get('price')} · {q.get('change_pct',0):.2f}% today")
+        elif agent_key == "risk":
+            tk = yf.Ticker(T)
+            info = tk.info or {}
+            parts.append(f"Risk signals: beta={info.get('beta')}, shortRatio={info.get('shortRatio')}, debtToEquity={info.get('debtToEquity')}, currentRatio={info.get('currentRatio')}")
+        elif agent_key == "valuation":
+            tk = yf.Ticker(T)
+            info = tk.info or {}
+            parts.append(f"Valuation multiples: P/E={info.get('trailingPE')}, fwdPE={info.get('forwardPE')}, PS={info.get('priceToSalesTrailing12Months')}, PB={info.get('priceToBook')}, EV/EBITDA={info.get('enterpriseToEbitda')}")
+        elif agent_key == "news" or agent_key == "materiality":
+            tk = yf.Ticker(T)
+            news = tk.news or []
+            headlines = []
+            for n in news[:6]:
+                h = n.get("title") or (n.get("content") or {}).get("title")
+                if h: headlines.append(f"- {h}")
+            if headlines:
+                parts.append("Recent headlines:\n" + "\n".join(headlines))
+        elif agent_key == "macro":
+            # macro tickers: rates (^TNX), oil (CL=F), dollar (DX-Y.NYB)
+            for label, sym in [("US 10y", "^TNX"), ("Oil", "CL=F"), ("USD Index", "DX-Y.NYB")]:
+                q = _fetch_quote(sym)
+                if q.get("price"):
+                    parts.append(f"  {label}: {q['price']:.2f} ({q.get('change_pct',0):+.2f}%)")
+    except Exception as e:
+        logger.debug(f"context enrichment failed for {agent_key}/{T}: {e}")
+    return "\n".join(parts)
 
 async def run_agent(agent_key: str, prompt: str, context: str = "") -> Dict[str, Any]:
     system = AGENT_SYSTEM.get(agent_key, AGENT_SYSTEM["research"])
+    cfg = AGENT_CONFIG.get(agent_key, AGENT_CONFIG["research"])
     system += (
         "\n\nYou MUST respond in strict JSON with these keys: "
-        "summary (string, 2-4 sentences), "
-        "evidence (array of strings), "
+        f"summary (string, 2-4 sentences), "
+        f"evidence (array of strings, up to {cfg['max_evidence']} items), "
         "sources (array of strings), "
         "confidence (number 0-100), "
         "assumptions (array of strings). "
         "No markdown. Only JSON."
     )
     if not EMERGENT_LLM_KEY:
-        return {
-            "summary": "AI key missing. Configure EMERGENT_LLM_KEY.",
-            "evidence": [], "sources": [], "confidence": 0, "assumptions": []
-        }
+        return {"summary": "AI key missing. Configure EMERGENT_LLM_KEY.",
+                "evidence": [], "sources": [], "confidence": 0, "assumptions": []}
     try:
         chat = LlmChat(
             api_key=EMERGENT_LLM_KEY,
             session_id=f"{agent_key}-{uuid.uuid4().hex[:8]}",
             system_message=system,
-        ).with_model("openai", "gpt-5.2")
-        full_prompt = f"{context}\n\nQuestion: {prompt}" if context else prompt
-        reply = await chat.send_message(UserMessage(text=full_prompt))
+        ).with_model("openai", cfg["model"])
+        reply = await chat.send_message(UserMessage(text=context + "\n\n" + prompt if context else prompt))
         text = reply.strip() if isinstance(reply, str) else str(reply)
-        # extract JSON
-        start = text.find("{")
-        end = text.rfind("}")
+        start = text.find("{"); end = text.rfind("}")
         if start >= 0 and end > start:
             text = text[start:end+1]
         parsed = json.loads(text)
@@ -643,13 +712,12 @@ async def run_agent(agent_key: str, prompt: str, context: str = "") -> Dict[str,
         parsed.setdefault("sources", [])
         parsed.setdefault("confidence", 60)
         parsed.setdefault("assumptions", [])
+        parsed["_meta"] = {"agent": agent_key, "model": cfg["model"], "temperature": cfg["temperature"]}
         return parsed
     except Exception as e:
         logger.error(f"agent {agent_key} failed: {e}")
-        return {
-            "summary": f"Analysis unavailable: {str(e)[:100]}",
-            "evidence": [], "sources": [], "confidence": 0, "assumptions": []
-        }
+        return {"summary": f"Analysis unavailable: {str(e)[:100]}",
+                "evidence": [], "sources": [], "confidence": 0, "assumptions": []}
 
 @api.post("/agents/query")
 async def agents_query(body: AgentQueryBody, user=Depends(get_current_user)):
@@ -657,15 +725,48 @@ async def agents_query(body: AgentQueryBody, user=Depends(get_current_user)):
     if body.ticker:
         profile = await company_profile(body.ticker, user)
         quote = _fetch_quote(body.ticker)
-        context = f"Ticker: {body.ticker.upper()}. Company: {profile.get('name')}. Sector: {profile.get('sector')}. Price: {quote.get('price')}. Summary: {(profile.get('summary') or '')[:800]}"
+        context = f"Ticker: {body.ticker.upper()}. Company: {profile.get('name')}. Sector: {profile.get('sector')}. Price: {quote.get('price')}. Summary: {(profile.get('summary') or '')[:500]}"
+    # per-agent context enrichment
+    context = await _build_agent_context(body.agent, body.ticker, context)
     result = await run_agent(body.agent, body.question, context)
-    # store
     await db.agent_runs.insert_one({
         "run_id": str(uuid.uuid4()), "user_id": user["user_id"],
         "agent": body.agent, "ticker": body.ticker, "question": body.question,
         "result": result, "created_at": now_iso()
     })
     return result
+
+
+class NoteAssistBody(BaseModel):
+    context_type: str  # note|thesis|journal_reason|journal_expected|catalyst|risk|assumption
+    current_text: Optional[str] = ""
+    ticker: Optional[str] = None
+    instruction: Optional[str] = None
+
+@api.post("/agents/assist")
+async def agent_assist(body: NoteAssistBody, user=Depends(get_current_user)):
+    """Universal AI writing assist for any text field in the app."""
+    ctx_bits = []
+    if body.ticker:
+        try:
+            profile = await company_profile(body.ticker, user)
+            quote = _fetch_quote(body.ticker)
+            ctx_bits.append(f"Context: {body.ticker.upper()} · {profile.get('name')} · {profile.get('sector')} · ${quote.get('price')} · P/E {profile.get('pe')}")
+        except Exception:
+            pass
+    action = body.instruction or "improve"
+    guide = {
+        "note":             "Rewrite this research note to be clearer, more analytical, and structured. Keep the same length ballpark.",
+        "thesis":           "Rewrite this investment thesis narrative to be sharp, evidence-anchored, and specific about the mechanism (why it works).",
+        "journal_reason":   "Rewrite this decision reason to be crisp and specific about the actual driver behind the buy/sell/hold.",
+        "journal_expected": "Rewrite this expected-outcome statement to be measurable (metric + timeframe + threshold).",
+        "catalyst":         "Suggest 3 concrete catalysts (dated where possible) as bullet points.",
+        "risk":             "Suggest 3 concrete risks (specific, not generic) as bullet points.",
+        "assumption":       "Rewrite this assumption into a testable, monitorable statement.",
+    }.get(body.context_type, "Improve the writing.")
+    prompt = f"{guide}\n\nAction: {action}.\n\nCurrent text:\n\"\"\"\n{body.current_text or '(empty)'}\n\"\"\"\n\nReturn ONLY the rewritten/generated text in the 'summary' field."
+    return await run_agent("note_assist", prompt, "\n".join(ctx_bits))
+
 
 @api.get("/market/brief")
 async def market_brief(user=Depends(get_current_user)):
@@ -778,7 +879,7 @@ def _tokenize(s: str) -> List[str]:
     return [t.lower() for t in _TOKEN_RE.findall(s)]
 
 async def _bm25_retrieve(user_id: str, query: str, ticker: Optional[str] = None, top_k: int = 8) -> List[Dict[str, Any]]:
-    """Retrieve top-K chunks across user's documents using BM25."""
+    """Retrieve top-K chunks across user's documents using BM25 with fallback to all chunks."""
     q = {"user_id": user_id}
     if ticker:
         q["ticker"] = ticker.upper()
@@ -790,7 +891,10 @@ async def _bm25_retrieve(user_id: str, query: str, ticker: Optional[str] = None,
     query_tokens = _tokenize(query) or ["contradiction", "risk", "guidance"]
     scores = bm25.get_scores(query_tokens)
     ranked = sorted(zip(chunks, scores), key=lambda x: x[1], reverse=True)
-    return [{"chunk": c, "score": float(s)} for c, s in ranked[:top_k] if s > 0]
+    # Return top_k regardless of score (small corpora often score all near zero).
+    top = ranked[:top_k]
+    # If ALL scores are zero, keep them anyway — we still want to send chunks to the LLM.
+    return [{"chunk": c, "score": float(s)} for c, s in top]
 
 @api.post("/documents/upload")
 async def upload_doc(file: UploadFile = File(...), ticker: Optional[str] = None, user=Depends(get_current_user)):

@@ -365,12 +365,33 @@ async def company_news(ticker: str, user=Depends(get_current_user)):
     try:
         t = yf.Ticker(ticker)
         news = t.news or []
-        data = [{
-            "title": n.get("title") or (n.get("content") or {}).get("title"),
-            "publisher": n.get("publisher") or (n.get("content") or {}).get("provider", {}).get("displayName"),
-            "link": n.get("link") or ((n.get("content") or {}).get("canonicalUrl") or {}).get("url"),
-            "published": n.get("providerPublishTime") or (n.get("content") or {}).get("pubDate"),
-        } for n in news[:10]]
+        profile_c = _cache_get(f"profile:{ticker}", 3600) or {}
+        company_name = (profile_c.get("name") or "").split(" ")[0].lower() if profile_c else ""
+        tk_lower = ticker.lower()
+        data = []
+        for n in news[:25]:
+            title = n.get("title") or (n.get("content") or {}).get("title") or ""
+            link  = n.get("link") or ((n.get("content") or {}).get("canonicalUrl") or {}).get("url")
+            pub   = n.get("publisher") or (n.get("content") or {}).get("provider", {}).get("displayName")
+            when  = n.get("providerPublishTime") or (n.get("content") or {}).get("pubDate")
+            # Relevance filter: title must mention the ticker OR primary company name token,
+            # OR must include ticker in the linked URL (protects against generic market news).
+            hay = (title + " " + (link or "")).lower()
+            rel = (tk_lower in hay) or (company_name and company_name in hay)
+            if not rel:
+                continue
+            data.append({"title": title, "publisher": pub, "link": link, "published": when})
+            if len(data) >= 10: break
+        # If filter was too strict, return top 5 unfiltered as fallback
+        if not data:
+            for n in news[:5]:
+                title = n.get("title") or (n.get("content") or {}).get("title") or ""
+                data.append({
+                    "title": title,
+                    "publisher": n.get("publisher") or (n.get("content") or {}).get("provider", {}).get("displayName"),
+                    "link": n.get("link") or ((n.get("content") or {}).get("canonicalUrl") or {}).get("url"),
+                    "published": n.get("providerPublishTime") or (n.get("content") or {}).get("pubDate"),
+                })
     except Exception as e:
         data = []
     _cache_set(f"news:{ticker}", data)
@@ -1688,14 +1709,19 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def startup():
-    # Schedule auto-recheck of thesis assumptions every 6 hours.
-    # In production, swap to Celery beat with the same job function.
+    # Celery beat is now the primary scheduler (see /etc/supervisor/conf.d/celery.conf).
+    # We still start APScheduler as a fallback for local dev without workers, but skip
+    # it if REDIS_URL is set AND we detect Celery beat is expected to run.
+    use_celery = os.environ.get("REDIS_URL") and os.environ.get("USE_CELERY_BEAT", "1") == "1"
+    if use_celery:
+        logger.info("scheduler: Celery beat expected to handle scheduling (REDIS_URL set)")
+        return
     try:
         scheduler.add_job(thesis_auto_recheck_job, "interval", hours=6, id="thesis_auto_recheck",
                           next_run_time=datetime.now(timezone.utc) + timedelta(minutes=5),
                           max_instances=1, coalesce=True)
         scheduler.start()
-        logger.info("scheduler: started, next run in 5 minutes")
+        logger.info("scheduler: APScheduler started (fallback), next run in 5 minutes")
     except Exception as e:
         logger.error(f"scheduler failed to start: {e}")
 

@@ -400,29 +400,83 @@ async def universal_search(q: str, user=Depends(get_current_user)):
     return {"results": results}
 
 
-# ---------------- Watchlist ----------------
+# ---------------- Watchlist (multi-list, asset class, free plan cap) ----------------
+FREE_PLAN_ADDITIONAL_CAP = 5  # user may add this many beyond seeded defaults per list
+
+DEFAULT_LISTS = {
+    "stocks": ["AAPL","MSFT","NVDA","GOOGL","TSLA"],
+    "crypto": ["BTC-USD","ETH-USD","SOL-USD"],
+    "etfs":   ["SPY","QQQ","VTI"],
+}
+
+async def _ensure_default_lists(user_id: str):
+    for asset_class, tickers in DEFAULT_LISTS.items():
+        existing = await db.watchlist_lists.find_one({"user_id": user_id, "asset_class": asset_class}, {"_id": 0})
+        if not existing:
+            await db.watchlist_lists.insert_one({
+                "list_id": str(uuid.uuid4()), "user_id": user_id,
+                "asset_class": asset_class, "name": asset_class.upper(),
+                "default_tickers": tickers, "user_tickers": [],
+                "created_at": now_iso(), "updated_at": now_iso(),
+            })
+
 @api.get("/watchlist")
 async def get_watchlist(user=Depends(get_current_user)):
-    doc = await db.watchlists.find_one({"user_id": user["user_id"]}, {"_id": 0})
-    tickers = (doc or {}).get("tickers", [])
-    if not tickers:
-        # seed default watchlist
-        tickers = ["AAPL", "MSFT", "NVDA", "GOOGL", "TSLA"]
-        await db.watchlists.update_one({"user_id": user["user_id"]},
-                                       {"$set": {"tickers": tickers, "updated_at": now_iso()}}, upsert=True)
+    """Backward-compatible: returns primary (stocks) list."""
+    await _ensure_default_lists(user["user_id"])
+    doc = await db.watchlist_lists.find_one({"user_id": user["user_id"], "asset_class": "stocks"}, {"_id": 0})
+    tickers = (doc.get("default_tickers") or []) + (doc.get("user_tickers") or [])
     quotes = [_fetch_quote(t) for t in tickers]
     return {"tickers": tickers, "quotes": quotes}
 
+@api.get("/watchlist/lists")
+async def get_watchlist_lists(user=Depends(get_current_user)):
+    """Returns all lists grouped by asset_class with quotes and cap info."""
+    await _ensure_default_lists(user["user_id"])
+    lists = await db.watchlist_lists.find({"user_id": user["user_id"]}, {"_id": 0}).to_list(20)
+    plan = user.get("plan", "Free")
+    result = []
+    for lst in lists:
+        tickers = (lst.get("default_tickers") or []) + (lst.get("user_tickers") or [])
+        quotes = [_fetch_quote(t) for t in tickers]
+        result.append({
+            **lst,
+            "tickers": tickers,
+            "quotes": quotes,
+            "user_slots_used": len(lst.get("user_tickers") or []),
+            "user_slots_max": (FREE_PLAN_ADDITIONAL_CAP if plan == "Free" else 999),
+            "plan": plan,
+        })
+    return {"lists": result, "plan": plan, "additional_cap_free": FREE_PLAN_ADDITIONAL_CAP}
+
+class MultiWatchlistBody(BaseModel):
+    asset_class: str  # stocks|crypto|etfs
+    ticker: str
+
 @api.post("/watchlist/add")
-async def add_to_watchlist(body: WatchlistAddBody, user=Depends(get_current_user)):
-    await db.watchlists.update_one({"user_id": user["user_id"]},
-                                   {"$addToSet": {"tickers": body.ticker.upper()}, "$set": {"updated_at": now_iso()}}, upsert=True)
+async def add_to_watchlist(body: MultiWatchlistBody, user=Depends(get_current_user)):
+    if body.asset_class not in DEFAULT_LISTS:
+        raise HTTPException(status_code=400, detail="Invalid asset_class")
+    await _ensure_default_lists(user["user_id"])
+    lst = await db.watchlist_lists.find_one({"user_id": user["user_id"], "asset_class": body.asset_class}, {"_id": 0})
+    plan = user.get("plan", "Free")
+    if plan == "Free" and len(lst.get("user_tickers") or []) >= FREE_PLAN_ADDITIONAL_CAP:
+        raise HTTPException(status_code=403, detail=f"Free plan limit reached ({FREE_PLAN_ADDITIONAL_CAP} additional tickers per list). Upgrade to Pro for unlimited.")
+    ticker = body.ticker.upper()
+    if ticker in (lst.get("default_tickers") or []) or ticker in (lst.get("user_tickers") or []):
+        return {"ok": True, "already_added": True}
+    await db.watchlist_lists.update_one(
+        {"user_id": user["user_id"], "asset_class": body.asset_class},
+        {"$addToSet": {"user_tickers": ticker}, "$set": {"updated_at": now_iso()}}
+    )
     return {"ok": True}
 
 @api.post("/watchlist/remove")
-async def remove_from_watchlist(body: WatchlistAddBody, user=Depends(get_current_user)):
-    await db.watchlists.update_one({"user_id": user["user_id"]},
-                                   {"$pull": {"tickers": body.ticker.upper()}})
+async def remove_from_watchlist(body: MultiWatchlistBody, user=Depends(get_current_user)):
+    await db.watchlist_lists.update_one(
+        {"user_id": user["user_id"], "asset_class": body.asset_class},
+        {"$pull": {"user_tickers": body.ticker.upper()}}
+    )
     return {"ok": True}
 
 
@@ -1234,13 +1288,24 @@ async def _run_thesis_check_internal(thesis_id: str, user_id: str, reason: str =
             verdict = "broken" if "BROKEN" in blob else ("at_risk" if ("AT_RISK" in blob or "AT RISK" in blob) else "intact")
             updated.append({**a, "status": verdict, "last_checked": now_iso(), "reasoning": res.get("summary", "")})
         await db.living_theses.update_one({"thesis_id": thesis_id}, {"$set": {"assumptions": updated, "last_checked": now_iso(), "last_check_reason": reason}})
+        at_risk = sum(1 for u in updated if u["status"] == "at_risk")
+        broken = sum(1 for u in updated if u["status"] == "broken")
         # audit
         await db.scheduler_runs.insert_one({
             "run_id": str(uuid.uuid4()), "thesis_id": thesis_id, "user_id": user_id,
             "ticker": doc["ticker"], "reason": reason, "at": now_iso(),
-            "at_risk_count": sum(1 for u in updated if u["status"] == "at_risk"),
-            "broken_count": sum(1 for u in updated if u["status"] == "broken"),
+            "at_risk_count": at_risk, "broken_count": broken,
         })
+        # notify if any assumption compromised
+        if at_risk > 0 or broken > 0:
+            severity = "BROKEN" if broken > 0 else "AT-RISK"
+            title = f"{severity}: {doc['ticker']} thesis — {broken} broken, {at_risk} at risk"
+            body = (f"Auto-check triggered by <b>{reason}</b> flagged assumptions in your <b>{doc['ticker']}</b> "
+                    f"thesis (v{doc.get('version', 1)}, {doc.get('stance','').upper()}). "
+                    f"Open the thesis to review.")
+            await _create_notification(user_id, title, body, kind="thesis_alert",
+                                       meta={"ticker": doc["ticker"], "thesis_id": thesis_id,
+                                             "at_risk": at_risk, "broken": broken, "reason": reason})
         return updated
     except Exception as e:
         logger.error(f"scheduler check failed for {thesis_id}: {e}")
@@ -1356,6 +1421,157 @@ async def root():
     return {"service": "IntelligenceOS", "status": "ok", "time": now_iso()}
 
 
+# ---------------- Attractiveness Score & Ratings ----------------
+def _score_from(value: Optional[float], best: float, worst: float) -> Optional[float]:
+    """Linear scale value between best and worst → 0..100 (best→100). Returns None if value missing."""
+    if value is None:
+        return None
+    if best == worst:
+        return 50.0
+    v = max(min(value, max(best, worst)), min(best, worst))
+    return round(((v - worst) / (best - worst)) * 100, 1) if best > worst else round(((worst - v) / (worst - best)) * 100, 1)
+
+def _compute_score(profile: Dict[str, Any], quote: Dict[str, Any]) -> Dict[str, Any]:
+    """Compute a 0-100 attractiveness score with sub-scores. No AI — deterministic."""
+    pe = profile.get("pe")
+    fwd_pe = profile.get("forward_pe")
+    beta = profile.get("beta")
+    hi = profile.get("52w_high"); lo = profile.get("52w_low")
+    price = quote.get("price")
+    change_pct = quote.get("change_pct") or 0
+
+    # Value: lower PE is better (10 best, 60 worst). If missing use fwd_pe.
+    use_pe = pe if pe and 0 < pe < 200 else (fwd_pe if fwd_pe and 0 < fwd_pe < 200 else None)
+    value_score = _score_from(use_pe, best=10, worst=50)
+    if value_score is None: value_score = 50
+
+    # Momentum: position within 52w range (higher = strong; but not overheated)
+    momentum_score = 50
+    if price and hi and lo and hi > lo:
+        pos = (price - lo) / (hi - lo)  # 0..1
+        # sweet spot: 0.4 - 0.8. Overheated >0.9, weak <0.2
+        if pos <= 0.9:
+            momentum_score = round(pos * 100, 1)
+        else:
+            momentum_score = round(90 - (pos - 0.9) * 200, 1)  # penalize overheated
+        momentum_score = max(0, min(100, momentum_score))
+
+    # Quality: lower beta closer to 1 preferred; dividend yield positive; add if divYield exists
+    quality_score = 50
+    if beta is not None:
+        quality_score = 100 - min(100, abs(beta - 1) * 60)
+    if profile.get("dividend_yield"):
+        quality_score = min(100, quality_score + 10)
+
+    # Sentiment: today's change
+    sentiment_score = max(0, min(100, 50 + change_pct * 4))
+
+    overall = round((value_score * 0.35 + momentum_score * 0.25 + quality_score * 0.25 + sentiment_score * 0.15), 1)
+    if overall >= 75: rating = "STRONG_BUY"
+    elif overall >= 60: rating = "BUY"
+    elif overall >= 45: rating = "HOLD"
+    elif overall >= 30: rating = "SELL"
+    else: rating = "STRONG_SELL"
+
+    return {
+        "overall": overall,
+        "rating": rating,
+        "components": {
+            "value": round(value_score, 1),
+            "momentum": round(momentum_score, 1),
+            "quality": round(quality_score, 1),
+            "sentiment": round(sentiment_score, 1),
+        },
+        "signals": {
+            "pe": use_pe,
+            "range_position_pct": round((price - lo) / (hi - lo) * 100, 1) if (price and hi and lo and hi > lo) else None,
+            "beta": beta,
+            "change_pct": change_pct,
+        }
+    }
+
+@api.get("/company/{ticker}/score")
+async def company_score(ticker: str, user=Depends(get_current_user)):
+    profile = await company_profile(ticker, user)
+    quote = _fetch_quote(ticker)
+    score = _compute_score(profile, quote)
+    return {"ticker": ticker.upper(), "name": profile.get("name"), "sector": profile.get("sector"),
+            "price": quote.get("price"), "change_pct": quote.get("change_pct"), **score,
+            "as_of": now_iso()}
+
+class RatingsBody(BaseModel):
+    tickers: List[str]
+    ai_rationale: bool = False
+
+@api.post("/ratings")
+async def bulk_ratings(body: RatingsBody, user=Depends(get_current_user)):
+    """Return attractiveness score + rating for a list of tickers. Optionally add AI one-liner."""
+    rows = []
+    for t in body.tickers[:50]:
+        try:
+            profile = await company_profile(t, user)
+            quote = _fetch_quote(t)
+            score = _compute_score(profile, quote)
+            row = {"ticker": t.upper(), "name": profile.get("name"), "sector": profile.get("sector"),
+                   "price": quote.get("price"), "change_pct": quote.get("change_pct"), **score}
+            if body.ai_rationale:
+                ctx = f"Ticker {t} · price ${quote.get('price')} · PE {profile.get('pe')} · sector {profile.get('sector')} · overall {score['overall']} · rating {score['rating']}"
+                r = await run_agent("research", "In one sentence, justify the rating.", ctx)
+                row["ai_rationale"] = r.get("summary", "")
+            rows.append(row)
+        except Exception as e:
+            logger.warning(f"ratings failed for {t}: {e}")
+            continue
+    return {"ratings": rows, "as_of": now_iso()}
+
+
+# ---------------- Notifications (in-app + email via Resend) ----------------
+async def _create_notification(user_id: str, title: str, body: str, kind: str, meta: Dict[str, Any] = None):
+    doc = {
+        "notification_id": str(uuid.uuid4()), "user_id": user_id,
+        "title": title, "body": body, "kind": kind,
+        "meta": meta or {}, "read": False, "created_at": now_iso(),
+    }
+    await db.notifications.insert_one(doc)
+    # optional email
+    resend_key = os.environ.get("RESEND_API_KEY")
+    if resend_key:
+        try:
+            import resend
+            resend.api_key = resend_key
+            user = await db.users.find_one({"user_id": user_id}, {"_id": 0})
+            if user and user.get("email"):
+                resend.Emails.send({
+                    "from": os.environ.get("RESEND_FROM", "IntelligenceOS <onboarding@resend.dev>"),
+                    "to": [user["email"]],
+                    "subject": title,
+                    "html": f"<h2>{title}</h2><p>{body}</p><p style='color:#888;font-size:12px'>— IntelligenceOS</p>",
+                })
+        except Exception as e:
+            logger.warning(f"resend email failed: {e}")
+    return doc
+
+@api.get("/notifications")
+async def list_notifications(unread_only: bool = False, user=Depends(get_current_user)):
+    q = {"user_id": user["user_id"]}
+    if unread_only: q["read"] = False
+    items = await db.notifications.find(q, {"_id": 0}).sort("created_at", -1).to_list(100)
+    unread = await db.notifications.count_documents({"user_id": user["user_id"], "read": False})
+    return {"notifications": items, "unread_count": unread}
+
+@api.post("/notifications/{nid}/read")
+async def mark_read(nid: str, user=Depends(get_current_user)):
+    await db.notifications.update_one({"notification_id": nid, "user_id": user["user_id"]},
+                                      {"$set": {"read": True, "read_at": now_iso()}})
+    return {"ok": True}
+
+@api.post("/notifications/read-all")
+async def mark_all_read(user=Depends(get_current_user)):
+    await db.notifications.update_many({"user_id": user["user_id"], "read": False},
+                                       {"$set": {"read": True, "read_at": now_iso()}})
+    return {"ok": True}
+
+
 app.include_router(api)
 app.add_middleware(
     CORSMiddleware,
@@ -1364,6 +1580,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 @app.on_event("startup")
 async def startup():

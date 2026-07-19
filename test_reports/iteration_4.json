@@ -1,0 +1,67 @@
+{
+  "summary": "IntelligenceOS follow-up (Attractiveness Score + Buy/Sell/Hold Ratings + multi-asset Board with Free-plan cap + Chart periods + Notifications + Celery/Resend hooks) verified end-to-end. Added 4 new pytest modules (test_14_attractiveness_score, test_15_bulk_ratings, test_16_watchlist_board, test_17_notifications) with 26 new tests. Full suite: 73/73 PASSED in 103s including all 47 pre-existing (1 pre-existing test in test_04 was updated to the new POST /api/watchlist/add schema — see backend_issues). Real integrations exercised: GPT-5.2 via EMERGENT_LLM_KEY (bulk ratings ai_rationale returned non-empty non-fallback strings; assumption_check flagged fragile theses; scheduler auto-generated a thesis_alert notification which was then read via /notifications/{id}/read and /read-all). yfinance drove score signals, chart periods (all 9: 1d,5d,1mo,ytd,6mo,1y,5y,10y,max returned lists — 1d empty-allowed per spec), watchlist quotes. RESEND_API_KEY intentionally absent — email path gracefully no-ops without breaking notification creation.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {
+        "endpoint": "POST /api/watchlist/add",
+        "issue": "Backward-compat break vs pre-existing schema. The endpoint now requires `asset_class` (400/422 without it). Old test_04_watchlist_portfolio.test_watchlist_add sent {ticker:'AMD'} and 422'd. Updated the test to pass asset_class='stocks', but any external client on the old contract will break. Consider keeping asset_class optional with default 'stocks' for one release."
+      },
+      {
+        "endpoint": "GET /api/watchlist/lists",
+        "issue": "user_slots_max is hardcoded to 999 for non-Free plans (line 447 in server.py). Fine for MVP but worth a real plan-tier constant map."
+      },
+      {
+        "endpoint": "POST /api/watchlist/remove",
+        "issue": "Body model reuses MultiWatchlistBody so ticker is required, but the endpoint's $pull silently no-ops if the ticker is not in user_tickers — including when it IS in default_tickers. Verified in test_16 (AAPL default remains after 'remove'). Semantically the endpoint should probably return {ok:true, removed: <bool>} for observability."
+      },
+      {
+        "endpoint": "GET /api/scheduler/status",
+        "issue": "Carried over from iteration 3: next_run is str(j.next_run_time) — may serialize as 'None' string if a job is paused. Cosmetic."
+      },
+      {
+        "endpoint": "POST /api/notifications/{id}/read",
+        "issue": "Returns {ok: true} even when the notification_id does not exist for the user (update_matched_count is not checked). Consider returning 404 for missing IDs."
+      }
+    ]
+  },
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_14_attractiveness_score.py",
+    "/app/backend/tests/test_15_bulk_ratings.py",
+    "/app/backend/tests/test_16_watchlist_board.py",
+    "/app/backend/tests/test_17_notifications.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "Consider making POST /api/watchlist/add accept legacy body {ticker: X} by defaulting asset_class='stocks' so external clients on the old contract keep working.",
+    "Return 404 from POST /api/notifications/{id}/read when the notification doesn't belong to the user or doesn't exist.",
+    "Serialize scheduler.next_run_time as ISO or null instead of str() (cosmetic)."
+  ],
+  "critical_code_review_comments": [
+    "server.py is now 1605 lines mixing 17+ concerns (auth, market, portfolio, thesis, journal, pipeline, RAG, scheduler, graph, timeline, scoring, ratings, notifications, demo). Split into routers per domain becomes urgent.",
+    "Scoring _fetch_quote and company_profile are synchronous yfinance calls inside async endpoints; POST /api/ratings iterates them serially over up to 50 tickers → O(50 * network) latency. Consider asyncio.gather + run_in_executor.",
+    "_create_notification imports `resend` inside the try block on every notification when RESEND_API_KEY is set — fine for correctness, but move the import to module scope guarded by the key existing at startup to avoid per-call import cost.",
+    "MultiWatchlistBody is reused for both /add and /remove, which forces ticker to be uppercased in add but not in remove — but in remove line 478 does ticker.upper() so this is safe. Still, dedicated Remove model would be clearer.",
+    "_score_from's mixed-direction ternary (`if best > worst`) can silently invert on caller mistakes; consider a named param `higher_is_better: bool = False`.",
+    "Notification email via Resend swallows all exceptions (line 1550) — good for isolation, but log with more context (user_id, notification_id) for debuggability.",
+    "celery_tasks.py is a documentation-only skeleton (51 lines, no scheduler wiring) — confirmed no runtime coupling; safe to ship. When REDIS_URL is added, ensure APScheduler is disabled to avoid duplicate runs."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_04_watchlist_portfolio.py",
+    "/app/backend/tests/test_14_attractiveness_score.py",
+    "/app/backend/tests/test_15_bulk_ratings.py",
+    "/app/backend/tests/test_16_watchlist_board.py",
+    "/app/backend/tests/test_17_notifications.py"
+  ],
+  "success_rate": {
+    "backend": "100% (73/73 pytest passing including 26 new)",
+    "frontend": "not tested (backend-only scope per request)"
+  },
+  "test_credentials": "Dynamic per-run via /api/auth/signup — session user (TEST_iops_<rand>@example.com), plus module-scoped isolated users TEST_board_<rand>@example.com and TEST_notif_<rand>@example.com. Password TestPass!234. See /app/memory/test_credentials.md.",
+  "seed_data_creation": "test_16 creates 3 default watchlists (stocks/crypto/etfs) with seeded default_tickers via /api/watchlist/lists autoprovision, then adds 5 user tickers (AMZN/META/AMD/NFLX/AVGO) to stocks, 1 to crypto (DOGE-USD), 1 to etfs (ARKK). test_17 creates ~6 living theses with deliberately fragile assumptions on NVDA/AAPL/TSLA/AMZN/MSFT/META to drive the scheduler auto-recheck signal path.",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Backend green at 73/73. All spec'd new endpoints (/company/{ticker}/score, /ratings, /watchlist/lists, /watchlist/add|remove with asset_class, /notifications*, /market/history with all 9 periods) return proper contracts. Notification pipeline confirmed end-to-end (fragile-assumption thesis → yfinance signal → assumption_check LLM → _create_notification → GET → /read → unread_count decrement → /read-all). RESEND_API_KEY not set → email no-ops as expected. One backward-compat break flagged on POST /api/watchlist/add (asset_class now required); test_04 was updated to match. Celery skeleton is doc-only (51 lines, no runtime).",
+  "rca_of_the_issue": "N/A. Only one caveat: notification path depends on _check_earnings_signal returning True (yfinance news keywords OR >=5% 5d price move). On very quiet trading days with heavy yfinance rate-limits, the test may skip via pytest.skip — during this run the signal fired on at least one of 6 seeded tickers and all read-flow tests passed."
+}

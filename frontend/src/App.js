@@ -22,6 +22,8 @@ import Settings from "@/pages/Settings";
 import Pipeline from "@/pages/Pipeline";
 import Journal from "@/pages/Journal";
 import Timeline from "@/pages/Timeline";
+import Board from "@/pages/Board";
+import Ratings from "@/pages/Ratings";
 
 function AppRouter() {
   const location = useLocation();
@@ -48,6 +50,8 @@ function AppRouter() {
         <Route path="/pipeline" element={<Pipeline />} />
         <Route path="/journal" element={<Journal />} />
         <Route path="/timeline/:ticker" element={<Timeline />} />
+        <Route path="/board" element={<Board />} />
+        <Route path="/ratings" element={<Ratings />} />
         <Route path="/team" element={<Team />} />
         <Route path="/settings" element={<Settings />} />
       </Route>

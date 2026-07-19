@@ -12,8 +12,10 @@ def test_watchlist_seed_default(auth_client, base_url):
 
 
 def test_watchlist_add(auth_client, base_url):
-    r = auth_client.post(f"{base_url}/api/watchlist/add", json={"ticker": "AMD"}, timeout=30)
-    assert r.status_code == 200
+    # NOTE: /api/watchlist/add now requires asset_class (new multi-list schema).
+    r = auth_client.post(f"{base_url}/api/watchlist/add",
+                         json={"asset_class": "stocks", "ticker": "AMD"}, timeout=30)
+    assert r.status_code == 200, r.text
     r2 = auth_client.get(f"{base_url}/api/watchlist", timeout=45)
     assert "AMD" in r2.json()["tickers"]
 

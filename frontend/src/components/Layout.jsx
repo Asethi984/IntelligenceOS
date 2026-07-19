@@ -1,12 +1,15 @@
 import { NavLink, Outlet, useNavigate } from "react-router-dom";
-import { LayoutDashboard, LineChart, Briefcase, FileText, Bot, Filter, Bell, Network, Users, Settings, LogOut, Search, Command, Calculator, FolderOpen, Zap, GitBranch, BookOpen, Clock } from "lucide-react";
+import { LayoutDashboard, LineChart, Briefcase, FileText, Bot, Filter, Bell, Network, Users, Settings, LogOut, Search, Command, Calculator, FolderOpen, Zap, GitBranch, BookOpen, Clock, LayoutGrid, ThumbsUp } from "lucide-react";
 import { useState } from "react";
 import CommandPalette from "@/components/CommandPalette";
+import NotificationBell from "@/components/NotificationBell";
 import { useAuth } from "@/contexts/AuthContext";
 import { Button } from "@/components/ui/button";
 
 const NAV = [
   { to: "/", label: "Command Center", icon: LayoutDashboard, end: true },
+  { to: "/board", label: "Board", icon: LayoutGrid },
+  { to: "/ratings", label: "Buy · Sell · Hold", icon: ThumbsUp },
   { to: "/markets", label: "Markets", icon: LineChart },
   { to: "/pipeline", label: "Pipeline", icon: GitBranch },
   { to: "/portfolio", label: "Portfolio", icon: Briefcase },
@@ -83,6 +86,7 @@ export default function Layout() {
           <div className="flex items-center gap-4 text-xs font-mono">
             <span className="pulse-live text-muted-foreground">MARKET · <span className="text-foreground">OPEN</span></span>
             <span className="text-muted-foreground">{new Date().toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })}</span>
+            <NotificationBell />
           </div>
         </header>
 

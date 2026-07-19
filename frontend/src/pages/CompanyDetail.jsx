@@ -32,20 +32,26 @@ export default function CompanyDetail() {
   const [profile, setProfile] = useState(null);
   const [quote, setQuote] = useState(null);
   const [hist, setHist] = useState([]);
+  const [period, setPeriod] = useState("6mo");
   const [fin, setFin] = useState(null);
   const [news, setNews] = useState([]);
   const [thesis, setThesis] = useState([]);
+  const [score, setScore] = useState(null);
   const [agentResults, setAgentResults] = useState({});
   const [agentLoading, setAgentLoading] = useState({});
 
   useEffect(() => {
     api.get(`/company/${ticker}/profile`).then(r => setProfile(r.data));
     api.get(`/market/quote/${ticker}`).then(r => setQuote(r.data));
-    api.get(`/market/history/${ticker}?period=6mo`).then(r => setHist(r.data));
     api.get(`/company/${ticker}/financials`).then(r => setFin(r.data));
     api.get(`/company/${ticker}/news`).then(r => setNews(r.data));
     api.get(`/thesis/legacy/${ticker}`).then(r => setThesis(r.data)).catch(() => {});
+    api.get(`/company/${ticker}/score`).then(r => setScore(r.data)).catch(() => {});
   }, [ticker]);
+
+  useEffect(() => {
+    api.get(`/market/history/${ticker}?period=${period}`).then(r => setHist(r.data));
+  }, [ticker, period]);
 
   const runAgent = async (key) => {
     setAgentLoading((s) => ({ ...s, [key]: true }));
@@ -73,6 +79,14 @@ export default function CompanyDetail() {
             <h1 className="text-3xl font-light tracking-tighter font-mono">{ticker}</h1>
             <span className="text-sm text-muted-foreground">{profile?.name}</span>
             <span className="text-xs px-2 py-0.5 border border-line rounded text-muted-foreground">{profile?.sector}</span>
+            {score && (
+              <span className={`text-[10px] font-mono px-2 py-0.5 rounded border tracking-widest ${
+                score.rating?.includes("BUY") ? "text-positive border-positive/60" :
+                score.rating === "HOLD" ? "text-warning border-warning/60" :
+                "text-negative border-negative/60"}`} data-testid="score-badge">
+                {score.rating?.replace("_", " ")} · <span className="text-foreground">{score.overall}</span>
+              </span>
+            )}
           </div>
           <div className="mt-3 flex items-baseline gap-4">
             <span className="text-4xl font-mono tracking-tight">${fmt(quote?.price)}</span>
@@ -110,7 +124,17 @@ export default function CompanyDetail() {
 
       {/* Chart */}
       <div className="border border-line bg-panel rounded-md">
-        <div className="overline px-4 py-2.5 border-b border-line">Price · 6M</div>
+        <div className="flex items-center justify-between px-4 py-2.5 border-b border-line">
+          <div className="overline">Price</div>
+          <div className="flex gap-0.5">
+            {[["1d","1D"],["5d","5D"],["1mo","1M"],["ytd","YTD"],["6mo","6M"],["1y","1Y"],["5y","5Y"],["10y","10Y"],["max","MAX"]].map(([v,l]) => (
+              <button key={v} onClick={() => setPeriod(v)} data-testid={`period-${v}`}
+                className={`px-2.5 py-1 text-[10px] font-mono uppercase tracking-widest rounded ${period === v ? "bg-terminal text-black" : "text-muted-foreground hover:bg-surface"}`}>
+                {l}
+              </button>
+            ))}
+          </div>
+        </div>
         <div className="h-64 p-2">
           <ResponsiveContainer width="100%" height="100%">
             <LineChart data={hist}>
@@ -122,6 +146,31 @@ export default function CompanyDetail() {
           </ResponsiveContainer>
         </div>
       </div>
+
+      {/* Attractiveness Score panel */}
+      {score && (
+        <div className="border border-line bg-panel rounded-md p-4" data-testid="score-panel">
+          <div className="flex items-center justify-between mb-3">
+            <div className="overline">Attractiveness Score</div>
+            <div className="text-xs text-muted-foreground font-mono">Value + Momentum + Quality + Sentiment</div>
+          </div>
+          <div className="grid grid-cols-5 gap-4">
+            <div>
+              <div className="text-4xl font-light tracking-tighter font-mono">{score.overall}</div>
+              <div className={`text-xs font-mono uppercase tracking-widest mt-1 ${score.rating?.includes("BUY") ? "text-positive" : score.rating === "HOLD" ? "text-warning" : "text-negative"}`}>{score.rating?.replace("_"," ")}</div>
+            </div>
+            {["value","momentum","quality","sentiment"].map((k) => (
+              <div key={k}>
+                <div className="overline mb-1">{k}</div>
+                <div className="font-mono text-lg">{score.components?.[k]}</div>
+                <div className="h-1 bg-surface rounded-full mt-1 overflow-hidden">
+                  <div className={`h-full ${(score.components?.[k] || 0) >= 60 ? "bg-positive" : (score.components?.[k] || 0) >= 40 ? "bg-warning" : "bg-negative"}`} style={{ width: `${score.components?.[k] || 0}%` }} />
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Tabs */}
       <Tabs defaultValue="overview">

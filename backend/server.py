@@ -1709,19 +1709,15 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def startup():
-    # Celery beat is now the primary scheduler (see /etc/supervisor/conf.d/celery.conf).
-    # We still start APScheduler as a fallback for local dev without workers, but skip
-    # it if REDIS_URL is set AND we detect Celery beat is expected to run.
-    use_celery = os.environ.get("REDIS_URL") and os.environ.get("USE_CELERY_BEAT", "1") == "1"
-    if use_celery:
-        logger.info("scheduler: Celery beat expected to handle scheduling (REDIS_URL set)")
-        return
+    # Always register APScheduler (in-process). Celery beat (if running) is an
+    # additional scheduler for prod scale — either firing this job is fine
+    # (max_instances=1 + coalesce prevents overlap).
     try:
         scheduler.add_job(thesis_auto_recheck_job, "interval", hours=6, id="thesis_auto_recheck",
                           next_run_time=datetime.now(timezone.utc) + timedelta(minutes=5),
                           max_instances=1, coalesce=True)
         scheduler.start()
-        logger.info("scheduler: APScheduler started (fallback), next run in 5 minutes")
+        logger.info("scheduler: APScheduler started, next run in 5 minutes")
     except Exception as e:
         logger.error(f"scheduler failed to start: {e}")
 

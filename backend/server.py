@@ -1,74 +1,1831 @@
-from fastapi import FastAPI, APIRouter
+"""IntelligenceOS Backend - FastAPI application."""
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response, UploadFile, File, Query, Cookie
+from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
-import logging
-from pathlib import Path
-from pydantic import BaseModel, Field, ConfigDict
-from typing import List
+import json
 import uuid
-from datetime import datetime, timezone
-
+import logging
+import asyncio
+import hashlib
+import secrets
+from pathlib import Path
+from pydantic import BaseModel, Field, EmailStr
+from typing import List, Optional, Dict, Any
+from datetime import datetime, timezone, timedelta
+import jwt as pyjwt
+import bcrypt
+import httpx
+import yfinance as yf
+from emergentintegrations.llm.chat import LlmChat, UserMessage
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from rank_bm25 import BM25Okapi
+import re as _re
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-# MongoDB connection
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+MONGO_URL = os.environ['MONGO_URL']
+DB_NAME = os.environ['DB_NAME']
+JWT_SECRET = os.environ['JWT_SECRET']
+EMERGENT_LLM_KEY = os.environ.get('EMERGENT_LLM_KEY', '')
+LLM_MODEL = os.environ.get('LLM_MODEL', 'gpt-5.4')
 
-# Create the main app without a prefix
-app = FastAPI()
+client = AsyncIOMotorClient(MONGO_URL)
+db = client[DB_NAME]
 
-# Create a router with the /api prefix
-api_router = APIRouter(prefix="/api")
+app = FastAPI(title="IntelligenceOS API")
+api = APIRouter(prefix="/api")
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("intelligence-os")
+
+# ---------------- Utilities ----------------
+def now_utc():
+    return datetime.now(timezone.utc)
+
+def now_iso():
+    return now_utc().isoformat()
+
+def hash_password(p: str) -> str:
+    return bcrypt.hashpw(p.encode(), bcrypt.gensalt()).decode()
+
+def verify_password(p: str, h: str) -> bool:
+    try:
+        return bcrypt.checkpw(p.encode(), h.encode())
+    except Exception:
+        return False
+
+def create_jwt(user_id: str) -> str:
+    payload = {"user_id": user_id, "exp": (now_utc() + timedelta(days=7)).timestamp()}
+    return pyjwt.encode(payload, JWT_SECRET, algorithm="HS256")
+
+async def get_current_user(request: Request) -> Dict[str, Any]:
+    # Try session_token from cookie or header (Emergent OAuth), then JWT
+    session_token = request.cookies.get("session_token")
+    auth_header = request.headers.get("Authorization", "")
+    bearer = auth_header.replace("Bearer ", "") if auth_header.startswith("Bearer ") else None
+
+    # Try session_token (Emergent OAuth)
+    token = session_token or bearer
+    if token:
+        session = await db.user_sessions.find_one({"session_token": token}, {"_id": 0})
+        if session:
+            expires_at = session.get("expires_at")
+            if isinstance(expires_at, str):
+                expires_at = datetime.fromisoformat(expires_at)
+            if expires_at and expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            if expires_at and expires_at > now_utc():
+                user = await db.users.find_one({"user_id": session["user_id"]}, {"_id": 0, "password_hash": 0})
+                if user:
+                    return user
+
+    # Try JWT
+    if bearer:
+        try:
+            payload = pyjwt.decode(bearer, JWT_SECRET, algorithms=["HS256"])
+            user = await db.users.find_one({"user_id": payload["user_id"]}, {"_id": 0, "password_hash": 0})
+            if user:
+                return user
+        except Exception:
+            pass
+
+    raise HTTPException(status_code=401, detail="Not authenticated")
 
 
-# Define Models
-class StatusCheck(BaseModel):
-    model_config = ConfigDict(extra="ignore")  # Ignore MongoDB's _id field
-    
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    client_name: str
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+# ---------------- Models ----------------
+class SignupBody(BaseModel):
+    email: EmailStr
+    password: str
+    name: str
 
-class StatusCheckCreate(BaseModel):
-    client_name: str
+class LoginBody(BaseModel):
+    email: EmailStr
+    password: str
 
-# Add your routes to the router instead of directly to app
-@api_router.get("/")
+class WatchlistAddBody(BaseModel):
+    ticker: str
+
+class ThesisBody(BaseModel):
+    ticker: str
+    stance: str  # bull/bear/neutral
+    thesis: str
+    evidence: Optional[List[str]] = []
+
+class NoteBody(BaseModel):
+    title: str
+    content: str
+    ticker: Optional[str] = None
+
+class AlertRuleBody(BaseModel):
+    ticker: str
+    condition: str  # e.g., "price_below", "price_above", "news"
+    value: Optional[float] = None
+    note: Optional[str] = None
+
+class PortfolioHoldingBody(BaseModel):
+    ticker: str
+    shares: float
+    cost_basis: float
+
+class AgentQueryBody(BaseModel):
+    agent: str  # research | financial | news | competitor | risk | valuation | macro
+    ticker: Optional[str] = None
+    question: str
+
+class ScreenerBody(BaseModel):
+    query: Optional[str] = None
+    min_market_cap: Optional[float] = None
+    max_pe: Optional[float] = None
+    sector: Optional[str] = None
+
+class DCFBody(BaseModel):
+    ticker: str
+    revenue: float
+    growth_rate: float  # e.g., 0.10
+    margin: float  # e.g., 0.20
+    wacc: float  # e.g., 0.09
+    terminal_growth: float  # e.g., 0.025
+    years: int = 5
+    shares_outstanding: float
+
+
+# ---------------- Auth ----------------
+@api.post("/auth/signup")
+async def signup(body: SignupBody, response: Response):
+    existing = await db.users.find_one({"email": body.email}, {"_id": 0})
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    user_id = f"user_{uuid.uuid4().hex[:12]}"
+    user = {
+        "user_id": user_id,
+        "email": body.email,
+        "name": body.name,
+        "password_hash": hash_password(body.password),
+        "role": "Owner",
+        "team_id": None,
+        "created_at": now_iso(),
+        "plan": "Free",
+    }
+    await db.users.insert_one(user)
+    token = create_jwt(user_id)
+    # welcome email (async, non-blocking, no-op if RESEND_API_KEY missing)
+    try:
+        welcome_body = (
+            f"Hi {body.name.split()[0] if body.name else 'there'}, welcome aboard.<br/><br/>"
+            "Your IntelligenceOS terminal is ready. Start with the Command Center to see live markets, "
+            "then try running one of the 12 AI agents on a ticker you care about.<br/><br/>"
+            "You're on the Free plan — 10 AI queries and 5 additional tickers per list to get started."
+        )
+        html = _email_html("Welcome to IntelligenceOS", welcome_body,
+                           os.environ.get("APP_URL", ""), "Open your terminal" if os.environ.get("APP_URL") else None)
+        asyncio.create_task(_send_email(body.email, "Welcome to IntelligenceOS", html))
+    except Exception:
+        pass
+    return {"token": token, "user": {"user_id": user_id, "email": body.email, "name": body.name, "role": "Owner", "plan": "Free"}}
+
+@api.post("/auth/login")
+async def login(body: LoginBody):
+    user = await db.users.find_one({"email": body.email}, {"_id": 0})
+    if not user or not user.get("password_hash") or not verify_password(body.password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    token = create_jwt(user["user_id"])
+    return {"token": token, "user": {k: v for k, v in user.items() if k != "password_hash"}}
+
+@api.post("/auth/oauth/session")
+async def oauth_session(request: Request, response: Response):
+    body = await request.json()
+    session_id = body.get("session_id")
+    if not session_id:
+        raise HTTPException(status_code=400, detail="Missing session_id")
+    async with httpx.AsyncClient() as c:
+        r = await c.get("https://demobackend.emergentagent.com/auth/v1/env/oauth/session-data",
+                        headers={"X-Session-ID": session_id})
+        if r.status_code != 200:
+            raise HTTPException(status_code=401, detail="Invalid session_id")
+        data = r.json()
+    email = data["email"]
+    existing = await db.users.find_one({"email": email}, {"_id": 0})
+    if existing:
+        user_id = existing["user_id"]
+        await db.users.update_one({"user_id": user_id}, {"$set": {"name": data.get("name"), "picture": data.get("picture")}})
+    else:
+        user_id = f"user_{uuid.uuid4().hex[:12]}"
+        await db.users.insert_one({
+            "user_id": user_id, "email": email, "name": data.get("name"),
+            "picture": data.get("picture"), "role": "Owner", "team_id": None,
+            "plan": "Free", "created_at": now_iso(),
+        })
+    session_token = data["session_token"]
+    expires_at = now_utc() + timedelta(days=7)
+    await db.user_sessions.insert_one({
+        "user_id": user_id, "session_token": session_token,
+        "expires_at": expires_at.isoformat(), "created_at": now_iso()
+    })
+    response.set_cookie("session_token", session_token, httponly=True, secure=True, samesite="none", path="/", max_age=7*24*3600)
+    user_out = await db.users.find_one({"user_id": user_id}, {"_id": 0, "password_hash": 0})
+    return {"user": user_out, "session_token": session_token}
+
+@api.get("/auth/me")
+async def me(user=Depends(get_current_user)):
+    return user
+
+@api.post("/auth/logout")
+async def logout(request: Request, response: Response):
+    token = request.cookies.get("session_token")
+    if token:
+        await db.user_sessions.delete_one({"session_token": token})
+    response.delete_cookie("session_token", path="/")
+    return {"ok": True}
+
+
+# ---------------- Market Data (yfinance) ----------------
+_yf_cache: Dict[str, Dict[str, Any]] = {}
+def _cache_get(key: str, ttl_sec: int = 300):
+    v = _yf_cache.get(key)
+    if v and (datetime.now().timestamp() - v["ts"]) < ttl_sec:
+        return v["data"]
+    return None
+
+def _cache_set(key: str, data: Any):
+    _yf_cache[key] = {"ts": datetime.now().timestamp(), "data": data}
+
+def _fetch_quote(ticker: str) -> Dict[str, Any]:
+    cached = _cache_get(f"quote:{ticker}", 60)
+    if cached:
+        return cached
+    try:
+        t = yf.Ticker(ticker)
+        info = t.fast_info if hasattr(t, 'fast_info') else {}
+        hist = t.history(period="2d")
+        price = float(hist["Close"].iloc[-1]) if len(hist) else None
+        prev = float(hist["Close"].iloc[-2]) if len(hist) >= 2 else price
+        change = (price - prev) if (price and prev) else 0
+        change_pct = (change / prev * 100) if prev else 0
+        data = {
+            "ticker": ticker.upper(),
+            "price": price,
+            "change": change,
+            "change_pct": change_pct,
+            "prev_close": prev,
+            "volume": int(hist["Volume"].iloc[-1]) if len(hist) else 0,
+            "market_cap": getattr(info, "market_cap", None) if info else None,
+        }
+    except Exception as e:
+        logger.warning(f"yfinance quote failed for {ticker}: {e}")
+        data = {"ticker": ticker.upper(), "price": None, "change": 0, "change_pct": 0, "error": str(e)}
+    _cache_set(f"quote:{ticker}", data)
+    return data
+
+@api.get("/market/quote/{ticker}")
+async def get_quote(ticker: str, user=Depends(get_current_user)):
+    return _fetch_quote(ticker)
+
+@api.get("/market/quotes")
+async def get_quotes(tickers: str, user=Depends(get_current_user)):
+    tks = [t.strip().upper() for t in tickers.split(",") if t.strip()]
+    return [_fetch_quote(t) for t in tks]
+
+@api.get("/market/history/{ticker}")
+async def get_history(ticker: str, period: str = "1mo", user=Depends(get_current_user)):
+    cached = _cache_get(f"hist:{ticker}:{period}", 300)
+    if cached:
+        return cached
+    try:
+        t = yf.Ticker(ticker)
+        hist = t.history(period=period)
+        data = [
+            {"date": idx.strftime("%Y-%m-%d"), "close": float(row["Close"]), "volume": int(row["Volume"])}
+            for idx, row in hist.iterrows()
+        ]
+    except Exception as e:
+        data = []
+    _cache_set(f"hist:{ticker}:{period}", data)
+    return data
+
+@api.get("/market/overview")
+async def market_overview(user=Depends(get_current_user)):
+    indices = ["^GSPC", "^IXIC", "^DJI", "^VIX", "^RUT"]
+    labels = {"^GSPC": "S&P 500", "^IXIC": "NASDAQ", "^DJI": "Dow Jones", "^VIX": "VIX", "^RUT": "Russell 2000"}
+    quotes = [{"label": labels[t], **_fetch_quote(t)} for t in indices]
+    sectors = ["XLK", "XLF", "XLE", "XLV", "XLY", "XLP", "XLI", "XLU", "XLB", "XLRE", "XLC"]
+    sector_labels = {"XLK":"Tech","XLF":"Financials","XLE":"Energy","XLV":"Health","XLY":"Cons. Disc.","XLP":"Cons. Staples","XLI":"Industrials","XLU":"Utilities","XLB":"Materials","XLRE":"Real Estate","XLC":"Comm."}
+    sector_data = [{"label": sector_labels[t], **_fetch_quote(t)} for t in sectors]
+    return {"indices": quotes, "sectors": sector_data, "as_of": now_iso()}
+
+@api.get("/company/{ticker}/profile")
+async def company_profile(ticker: str, user=Depends(get_current_user)):
+    cached = _cache_get(f"profile:{ticker}", 3600)
+    if cached:
+        return cached
+    try:
+        t = yf.Ticker(ticker)
+        info = t.info or {}
+        data = {
+            "ticker": ticker.upper(),
+            "name": info.get("longName") or info.get("shortName"),
+            "sector": info.get("sector"),
+            "industry": info.get("industry"),
+            "country": info.get("country"),
+            "website": info.get("website"),
+            "summary": info.get("longBusinessSummary"),
+            "market_cap": info.get("marketCap"),
+            "employees": info.get("fullTimeEmployees"),
+            "pe": info.get("trailingPE"),
+            "forward_pe": info.get("forwardPE"),
+            "dividend_yield": info.get("dividendYield"),
+            "beta": info.get("beta"),
+            "52w_high": info.get("fiftyTwoWeekHigh"),
+            "52w_low": info.get("fiftyTwoWeekLow"),
+        }
+    except Exception as e:
+        data = {"ticker": ticker.upper(), "error": str(e)}
+    _cache_set(f"profile:{ticker}", data)
+    return data
+
+@api.get("/company/{ticker}/financials")
+async def company_financials(ticker: str, user=Depends(get_current_user)):
+    cached = _cache_get(f"fin:{ticker}", 3600)
+    if cached:
+        return cached
+    try:
+        t = yf.Ticker(ticker)
+        income = t.financials.T if t.financials is not None else None
+        balance = t.balance_sheet.T if t.balance_sheet is not None else None
+        cashflow = t.cashflow.T if t.cashflow is not None else None
+        def to_records(df):
+            if df is None or df.empty:
+                return []
+            return [{"period": str(idx.date()) if hasattr(idx,'date') else str(idx), **{k: (float(v) if v==v else None) for k,v in row.items()}} for idx, row in df.iterrows()]
+        data = {
+            "income_statement": to_records(income)[:4],
+            "balance_sheet": to_records(balance)[:4],
+            "cash_flow": to_records(cashflow)[:4],
+        }
+    except Exception as e:
+        data = {"income_statement": [], "balance_sheet": [], "cash_flow": [], "error": str(e)}
+    _cache_set(f"fin:{ticker}", data)
+    return data
+
+@api.get("/company/{ticker}/news")
+async def company_news(ticker: str, user=Depends(get_current_user)):
+    cached = _cache_get(f"news:{ticker}", 300)
+    if cached:
+        return cached
+    try:
+        t = yf.Ticker(ticker)
+        news = t.news or []
+        profile_c = _cache_get(f"profile:{ticker}", 3600) or {}
+        company_name = (profile_c.get("name") or "").split(" ")[0].lower() if profile_c else ""
+        tk_lower = ticker.lower()
+        data = []
+        for n in news[:25]:
+            title = n.get("title") or (n.get("content") or {}).get("title") or ""
+            link  = n.get("link") or ((n.get("content") or {}).get("canonicalUrl") or {}).get("url")
+            pub   = n.get("publisher") or (n.get("content") or {}).get("provider", {}).get("displayName")
+            when  = n.get("providerPublishTime") or (n.get("content") or {}).get("pubDate")
+            # Relevance filter: title must mention the ticker OR primary company name token,
+            # OR must include ticker in the linked URL (protects against generic market news).
+            hay = (title + " " + (link or "")).lower()
+            rel = (tk_lower in hay) or (company_name and company_name in hay)
+            if not rel:
+                continue
+            data.append({"title": title, "publisher": pub, "link": link, "published": when})
+            if len(data) >= 10: break
+        # If filter was too strict, return top 5 unfiltered as fallback
+        if not data:
+            for n in news[:5]:
+                title = n.get("title") or (n.get("content") or {}).get("title") or ""
+                data.append({
+                    "title": title,
+                    "publisher": n.get("publisher") or (n.get("content") or {}).get("provider", {}).get("displayName"),
+                    "link": n.get("link") or ((n.get("content") or {}).get("canonicalUrl") or {}).get("url"),
+                    "published": n.get("providerPublishTime") or (n.get("content") or {}).get("pubDate"),
+                })
+    except Exception as e:
+        data = []
+    _cache_set(f"news:{ticker}", data)
+    return data
+
+@api.get("/search")
+async def universal_search(q: str, user=Depends(get_current_user)):
+    """Search tickers via yfinance."""
+    q = q.strip().upper()
+    if not q:
+        return {"results": []}
+    common = {
+        "AAPL": "Apple Inc.", "MSFT": "Microsoft", "GOOGL": "Alphabet", "AMZN": "Amazon",
+        "NVDA": "NVIDIA", "META": "Meta Platforms", "TSLA": "Tesla", "AMD": "AMD",
+        "NFLX": "Netflix", "JPM": "JPMorgan", "V": "Visa", "MA": "Mastercard",
+        "BRK-B": "Berkshire Hathaway", "UNH": "UnitedHealth", "XOM": "ExxonMobil",
+        "JNJ": "Johnson & Johnson", "WMT": "Walmart", "PG": "Procter & Gamble",
+    }
+    results = [{"ticker": t, "name": n} for t, n in common.items() if q in t or q.lower() in n.lower()][:8]
+    if not results and len(q) <= 5:
+        # fallback: try direct lookup
+        try:
+            p = _fetch_quote(q)
+            if p.get("price"):
+                results = [{"ticker": q, "name": q}]
+        except Exception:
+            pass
+    return {"results": results}
+
+
+# ---------------- Watchlist (multi-list, asset class, free plan cap) ----------------
+FREE_PLAN_ADDITIONAL_CAP = 5  # user may add this many beyond seeded defaults per list
+
+DEFAULT_LISTS = {
+    "stocks": ["AAPL","MSFT","NVDA","GOOGL","TSLA"],
+    "crypto": ["BTC-USD","ETH-USD","SOL-USD"],
+    "etfs":   ["SPY","QQQ","VTI"],
+}
+
+async def _ensure_default_lists(user_id: str):
+    for asset_class, tickers in DEFAULT_LISTS.items():
+        existing = await db.watchlist_lists.find_one({"user_id": user_id, "asset_class": asset_class}, {"_id": 0})
+        if not existing:
+            await db.watchlist_lists.insert_one({
+                "list_id": str(uuid.uuid4()), "user_id": user_id,
+                "asset_class": asset_class, "name": asset_class.upper(),
+                "default_tickers": tickers, "user_tickers": [],
+                "created_at": now_iso(), "updated_at": now_iso(),
+            })
+
+@api.get("/watchlist")
+async def get_watchlist(user=Depends(get_current_user)):
+    """Backward-compatible: returns primary (stocks) list."""
+    await _ensure_default_lists(user["user_id"])
+    doc = await db.watchlist_lists.find_one({"user_id": user["user_id"], "asset_class": "stocks"}, {"_id": 0})
+    tickers = (doc.get("default_tickers") or []) + (doc.get("user_tickers") or [])
+    quotes = [_fetch_quote(t) for t in tickers]
+    return {"tickers": tickers, "quotes": quotes}
+
+@api.get("/watchlist/lists")
+async def get_watchlist_lists(user=Depends(get_current_user)):
+    """Returns all lists grouped by asset_class with quotes and cap info."""
+    await _ensure_default_lists(user["user_id"])
+    lists = await db.watchlist_lists.find({"user_id": user["user_id"]}, {"_id": 0}).to_list(20)
+    plan = user.get("plan", "Free")
+    result = []
+    for lst in lists:
+        tickers = (lst.get("default_tickers") or []) + (lst.get("user_tickers") or [])
+        quotes = [_fetch_quote(t) for t in tickers]
+        result.append({
+            **lst,
+            "tickers": tickers,
+            "quotes": quotes,
+            "user_slots_used": len(lst.get("user_tickers") or []),
+            "user_slots_max": (FREE_PLAN_ADDITIONAL_CAP if plan == "Free" else 999),
+            "plan": plan,
+        })
+    return {"lists": result, "plan": plan, "additional_cap_free": FREE_PLAN_ADDITIONAL_CAP}
+
+class MultiWatchlistBody(BaseModel):
+    asset_class: str  # stocks|crypto|etfs
+    ticker: str
+
+@api.post("/watchlist/add")
+async def add_to_watchlist(body: MultiWatchlistBody, user=Depends(get_current_user)):
+    if body.asset_class not in DEFAULT_LISTS:
+        raise HTTPException(status_code=400, detail="Invalid asset_class")
+    await _ensure_default_lists(user["user_id"])
+    lst = await db.watchlist_lists.find_one({"user_id": user["user_id"], "asset_class": body.asset_class}, {"_id": 0})
+    plan = user.get("plan", "Free")
+    if plan == "Free" and len(lst.get("user_tickers") or []) >= FREE_PLAN_ADDITIONAL_CAP:
+        raise HTTPException(status_code=403, detail=f"Free plan limit reached ({FREE_PLAN_ADDITIONAL_CAP} additional tickers per list). Upgrade to Pro for unlimited.")
+    ticker = body.ticker.upper()
+    if ticker in (lst.get("default_tickers") or []) or ticker in (lst.get("user_tickers") or []):
+        return {"ok": True, "already_added": True}
+    await db.watchlist_lists.update_one(
+        {"user_id": user["user_id"], "asset_class": body.asset_class},
+        {"$addToSet": {"user_tickers": ticker}, "$set": {"updated_at": now_iso()}}
+    )
+    return {"ok": True}
+
+@api.post("/watchlist/remove")
+async def remove_from_watchlist(body: MultiWatchlistBody, user=Depends(get_current_user)):
+    await db.watchlist_lists.update_one(
+        {"user_id": user["user_id"], "asset_class": body.asset_class},
+        {"$pull": {"user_tickers": body.ticker.upper()}}
+    )
+    return {"ok": True}
+
+
+# ---------------- Portfolio ----------------
+@api.get("/portfolio")
+async def get_portfolio(user=Depends(get_current_user)):
+    holdings = await db.holdings.find({"user_id": user["user_id"]}, {"_id": 0}).to_list(200)
+    total_value = 0
+    total_cost = 0
+    enriched = []
+    for h in holdings:
+        q = _fetch_quote(h["ticker"])
+        price = q.get("price") or 0
+        value = price * h["shares"]
+        cost = h["cost_basis"] * h["shares"]
+        total_value += value
+        total_cost += cost
+        enriched.append({**h, "price": price, "value": value, "gain": value - cost,
+                        "gain_pct": ((value - cost) / cost * 100) if cost else 0,
+                        "change_pct": q.get("change_pct", 0)})
+    # allocation
+    for e in enriched:
+        e["allocation"] = (e["value"] / total_value * 100) if total_value else 0
+    return {
+        "holdings": enriched,
+        "total_value": total_value,
+        "total_cost": total_cost,
+        "total_gain": total_value - total_cost,
+        "total_gain_pct": ((total_value - total_cost) / total_cost * 100) if total_cost else 0,
+        "health_score": min(100, max(0, 70 + (10 if len(enriched) >= 5 else -10) + (20 if total_value > total_cost else -20))),
+    }
+
+@api.post("/portfolio/add")
+async def add_holding(body: PortfolioHoldingBody, user=Depends(get_current_user)):
+    h = {"holding_id": str(uuid.uuid4()), "user_id": user["user_id"],
+         "ticker": body.ticker.upper(), "shares": body.shares,
+         "cost_basis": body.cost_basis, "created_at": now_iso()}
+    await db.holdings.insert_one(h)
+    return {"ok": True, "holding_id": h["holding_id"]}
+
+@api.delete("/portfolio/{holding_id}")
+async def remove_holding(holding_id: str, user=Depends(get_current_user)):
+    await db.holdings.delete_one({"holding_id": holding_id, "user_id": user["user_id"]})
+    return {"ok": True}
+
+
+# ---------------- Notes / Research ----------------
+@api.get("/notes")
+async def list_notes(user=Depends(get_current_user)):
+    notes = await db.notes.find({"user_id": user["user_id"]}, {"_id": 0}).sort("updated_at", -1).to_list(100)
+    return notes
+
+@api.post("/notes")
+async def create_note(body: NoteBody, user=Depends(get_current_user)):
+    note = {"note_id": str(uuid.uuid4()), "user_id": user["user_id"],
+            "title": body.title, "content": body.content, "ticker": body.ticker,
+            "created_at": now_iso(), "updated_at": now_iso()}
+    await db.notes.insert_one(note)
+    return note
+
+@api.put("/notes/{note_id}")
+async def update_note(note_id: str, body: NoteBody, user=Depends(get_current_user)):
+    await db.notes.update_one({"note_id": note_id, "user_id": user["user_id"]},
+                              {"$set": {"title": body.title, "content": body.content, "ticker": body.ticker, "updated_at": now_iso()}})
+    return {"ok": True}
+
+@api.delete("/notes/{note_id}")
+async def delete_note(note_id: str, user=Depends(get_current_user)):
+    await db.notes.delete_one({"note_id": note_id, "user_id": user["user_id"]})
+    return {"ok": True}
+
+
+# ---------------- Thesis ----------------
+@api.get("/thesis/legacy/{ticker}")
+async def get_thesis(ticker: str, user=Depends(get_current_user)):
+    theses = await db.theses.find({"user_id": user["user_id"], "ticker": ticker.upper()}, {"_id": 0}).sort("created_at", -1).to_list(20)
+    return theses
+
+@api.post("/thesis")
+async def create_thesis(body: ThesisBody, user=Depends(get_current_user)):
+    doc = {"thesis_id": str(uuid.uuid4()), "user_id": user["user_id"],
+           "ticker": body.ticker.upper(), "stance": body.stance,
+           "thesis": body.thesis, "evidence": body.evidence,
+           "created_at": now_iso()}
+    await db.theses.insert_one(doc)
+    return {k: v for k, v in doc.items() if k != "_id"}
+
+
+# ---------------- Alerts ----------------
+@api.get("/alerts")
+async def list_alerts(user=Depends(get_current_user)):
+    rules = await db.alert_rules.find({"user_id": user["user_id"]}, {"_id": 0}).to_list(100)
+    fires = await db.alerts.find({"user_id": user["user_id"]}, {"_id": 0}).sort("created_at", -1).to_list(50)
+    return {"rules": rules, "fires": fires}
+
+@api.post("/alerts")
+async def create_alert(body: AlertRuleBody, user=Depends(get_current_user)):
+    r = {"rule_id": str(uuid.uuid4()), "user_id": user["user_id"],
+         "ticker": body.ticker.upper(), "condition": body.condition,
+         "value": body.value, "note": body.note, "created_at": now_iso(), "active": True}
+    await db.alert_rules.insert_one(r)
+    return {k: v for k, v in r.items() if k != "_id"}
+
+@api.delete("/alerts/{rule_id}")
+async def delete_alert(rule_id: str, user=Depends(get_current_user)):
+    await db.alert_rules.delete_one({"rule_id": rule_id, "user_id": user["user_id"]})
+    return {"ok": True}
+
+
+# ---------------- AI Agents ----------------
+AGENT_SYSTEM = {
+    "research": "You are a senior equity research analyst. Provide a concise, structured analysis with clear reasoning.",
+    "financial": "You are a CFA financial analyst. Focus on financials, ratios, and quality of earnings.",
+    "news": "You are a news impact analyst. Focus on materiality, sentiment, and affected entities.",
+    "competitor": "You are a competitive strategy analyst (Porter's Five Forces, moat analysis).",
+    "risk": "You are a risk analyst. Identify key risks, tail risks, and mitigations.",
+    "valuation": "You are a valuation expert. Explain DCF, comps, and scenario logic.",
+    "macro": "You are a macro strategist. Explain macro impacts on the given asset.",
+    "market_brief": "You are a market strategist writing the AI Market Brief.",
+    "portfolio_brief": "You are a portfolio strategist writing a daily portfolio brief.",
+    "contradiction": "You are a contradiction detector. Compare claims across 10-K, earnings calls, guidance, and news. Surface conflicts and inconsistencies with citations.",
+    "management": "You are a management-quality analyst. Score capital allocation, execution vs promises, dilution, and acquisitions history. Rate 0-100 on execution and integrity.",
+    "materiality": "You are a news materiality scorer. Rate 0-100 on how much a news item should move an investor's thesis, filtering noise from signal.",
+    "earnings_diff": "You are an earnings analyst. Compare current quarter vs previous quarter and guidance vs actual. Show what changed line-by-line, not just beat/miss.",
+    "bias": "You are a behavioral finance coach. Given a user's decision journal, identify recurring biases (confirmation, recency, loss aversion, anchoring, overconfidence, FOMO).",
+    "assumption_check": "You are an assumption auditor. Given a thesis assumption and current data, determine if it is INTACT, AT_RISK, or BROKEN with reasoning.",
+    "hidden_connections": "You are a portfolio pattern analyst. Given holdings, identify hidden thesis clusters (e.g., AI-infrastructure, rate-sensitive, China-exposed) that go beyond sector labels.",
+    "macro_exposure": "You are a macro exposure analyst. For a given portfolio, quantify exposure (0-100) to: interest rates, oil, China, AI, semiconductors, inflation, housing, defense, consumer.",
+    "note_assist": "You are an investment writing assistant. Rewrite or generate concise, analytical text for research notes, theses, journal entries, catalysts, risks, or assumptions. Match the requested tone. Return the rewritten text in 'summary'.",
+}
+
+# Per-agent runtime configuration (each agent is genuinely different, not just prompt)
+AGENT_CONFIG = {
+    "research":         {"model": LLM_MODEL,  "temperature": 0.4, "max_evidence": 6},
+    "financial":        {"model": LLM_MODEL,  "temperature": 0.2, "max_evidence": 8},
+    "news":             {"model": LLM_MODEL,  "temperature": 0.5, "max_evidence": 5},
+    "competitor":       {"model": LLM_MODEL,  "temperature": 0.4, "max_evidence": 6},
+    "risk":             {"model": LLM_MODEL,  "temperature": 0.3, "max_evidence": 8},
+    "valuation":        {"model": LLM_MODEL,  "temperature": 0.2, "max_evidence": 6},
+    "macro":            {"model": LLM_MODEL,  "temperature": 0.5, "max_evidence": 5},
+    "market_brief":     {"model": LLM_MODEL,  "temperature": 0.6, "max_evidence": 5},
+    "portfolio_brief":  {"model": LLM_MODEL,  "temperature": 0.4, "max_evidence": 5},
+    "contradiction":    {"model": LLM_MODEL,  "temperature": 0.2, "max_evidence": 10},
+    "management":       {"model": LLM_MODEL,  "temperature": 0.3, "max_evidence": 6},
+    "materiality":      {"model": LLM_MODEL,  "temperature": 0.3, "max_evidence": 4},
+    "earnings_diff":    {"model": LLM_MODEL,  "temperature": 0.2, "max_evidence": 8},
+    "bias":             {"model": LLM_MODEL,  "temperature": 0.6, "max_evidence": 6},
+    "assumption_check": {"model": LLM_MODEL,  "temperature": 0.2, "max_evidence": 4},
+    "hidden_connections":{"model": LLM_MODEL, "temperature": 0.5, "max_evidence": 6},
+    "macro_exposure":   {"model": LLM_MODEL,  "temperature": 0.3, "max_evidence": 9},
+    "note_assist":      {"model": LLM_MODEL,  "temperature": 0.6, "max_evidence": 0},
+}
+
+async def _build_agent_context(agent_key: str, ticker: Optional[str], base_ctx: str) -> str:
+    """Each agent gets a DIFFERENT enrichment of the context. This is where agents diverge in behavior."""
+    if not ticker:
+        return base_ctx
+    T = ticker.upper()
+    parts = [base_ctx] if base_ctx else []
+    try:
+        if agent_key == "financial" or agent_key == "earnings_diff":
+            tk = yf.Ticker(T)
+            fin = tk.financials.T if tk.financials is not None else None
+            if fin is not None and not fin.empty:
+                latest = fin.iloc[0].to_dict()
+                parts.append("Latest income statement: " + ", ".join(
+                    [f"{k}={v:.0f}" for k, v in list(latest.items())[:8] if isinstance(v, (int, float)) and v == v]))
+        elif agent_key == "competitor":
+            peers_map = {"AAPL":["MSFT","GOOGL"],"MSFT":["AAPL","GOOGL","ORCL"],"NVDA":["AMD","INTC","AVGO"],"TSLA":["F","GM","RIVN"],"META":["GOOGL","SNAP","PINS"],"AMZN":["WMT","MSFT","GOOGL"]}
+            peers = peers_map.get(T, [])
+            if peers:
+                parts.append(f"Peers to compare: {', '.join(peers)}")
+                for p in peers[:3]:
+                    q = _fetch_quote(p)
+                    parts.append(f"  {p}: ${q.get('price')} · {q.get('change_pct',0):.2f}% today")
+        elif agent_key == "risk":
+            tk = yf.Ticker(T)
+            info = tk.info or {}
+            parts.append(f"Risk signals: beta={info.get('beta')}, shortRatio={info.get('shortRatio')}, debtToEquity={info.get('debtToEquity')}, currentRatio={info.get('currentRatio')}")
+        elif agent_key == "valuation":
+            tk = yf.Ticker(T)
+            info = tk.info or {}
+            parts.append(f"Valuation multiples: P/E={info.get('trailingPE')}, fwdPE={info.get('forwardPE')}, PS={info.get('priceToSalesTrailing12Months')}, PB={info.get('priceToBook')}, EV/EBITDA={info.get('enterpriseToEbitda')}")
+        elif agent_key == "news" or agent_key == "materiality":
+            tk = yf.Ticker(T)
+            news = tk.news or []
+            headlines = []
+            for n in news[:6]:
+                h = n.get("title") or (n.get("content") or {}).get("title")
+                if h: headlines.append(f"- {h}")
+            if headlines:
+                parts.append("Recent headlines:\n" + "\n".join(headlines))
+        elif agent_key == "macro":
+            # macro tickers: rates (^TNX), oil (CL=F), dollar (DX-Y.NYB)
+            for label, sym in [("US 10y", "^TNX"), ("Oil", "CL=F"), ("USD Index", "DX-Y.NYB")]:
+                q = _fetch_quote(sym)
+                if q.get("price"):
+                    parts.append(f"  {label}: {q['price']:.2f} ({q.get('change_pct',0):+.2f}%)")
+    except Exception as e:
+        logger.debug(f"context enrichment failed for {agent_key}/{T}: {e}")
+    return "\n".join(parts)
+
+async def run_agent(agent_key: str, prompt: str, context: str = "") -> Dict[str, Any]:
+    system = AGENT_SYSTEM.get(agent_key, AGENT_SYSTEM["research"])
+    cfg = AGENT_CONFIG.get(agent_key, AGENT_CONFIG["research"])
+    system += (
+        "\n\nYou MUST respond in strict JSON with these keys: "
+        f"summary (string, 2-4 sentences), "
+        f"evidence (array of strings, up to {cfg['max_evidence']} items), "
+        "sources (array of strings), "
+        "confidence (number 0-100), "
+        "assumptions (array of strings). "
+        "No markdown. Only JSON."
+    )
+    if not EMERGENT_LLM_KEY:
+        return {"summary": "AI key missing. Configure EMERGENT_LLM_KEY.",
+                "evidence": [], "sources": [], "confidence": 0, "assumptions": []}
+    try:
+        chat = LlmChat(
+            api_key=EMERGENT_LLM_KEY,
+            session_id=f"{agent_key}-{uuid.uuid4().hex[:8]}",
+            system_message=system,
+        ).with_model("openai", cfg["model"])
+        reply = await chat.send_message(UserMessage(text=context + "\n\n" + prompt if context else prompt))
+        text = reply.strip() if isinstance(reply, str) else str(reply)
+        start = text.find("{"); end = text.rfind("}")
+        if start >= 0 and end > start:
+            text = text[start:end+1]
+        parsed = json.loads(text)
+        parsed.setdefault("summary", "")
+        parsed.setdefault("evidence", [])
+        parsed.setdefault("sources", [])
+        parsed.setdefault("confidence", 60)
+        parsed.setdefault("assumptions", [])
+        parsed["_meta"] = {"agent": agent_key, "model": cfg["model"], "temperature": cfg["temperature"]}
+        return parsed
+    except Exception as e:
+        logger.error(f"agent {agent_key} failed: {e}")
+        return {"summary": f"Analysis unavailable: {str(e)[:100]}",
+                "evidence": [], "sources": [], "confidence": 0, "assumptions": []}
+
+@api.post("/agents/query")
+async def agents_query(body: AgentQueryBody, user=Depends(get_current_user)):
+    context = ""
+    if body.ticker:
+        profile = await company_profile(body.ticker, user)
+        quote = _fetch_quote(body.ticker)
+        context = f"Ticker: {body.ticker.upper()}. Company: {profile.get('name')}. Sector: {profile.get('sector')}. Price: {quote.get('price')}. Summary: {(profile.get('summary') or '')[:500]}"
+    # per-agent context enrichment
+    context = await _build_agent_context(body.agent, body.ticker, context)
+    result = await run_agent(body.agent, body.question, context)
+    await db.agent_runs.insert_one({
+        "run_id": str(uuid.uuid4()), "user_id": user["user_id"],
+        "agent": body.agent, "ticker": body.ticker, "question": body.question,
+        "result": result, "created_at": now_iso()
+    })
+    return result
+
+
+class NoteAssistBody(BaseModel):
+    context_type: str  # note|thesis|journal_reason|journal_expected|catalyst|risk|assumption
+    current_text: Optional[str] = ""
+    ticker: Optional[str] = None
+    instruction: Optional[str] = None
+
+@api.post("/agents/assist")
+async def agent_assist(body: NoteAssistBody, user=Depends(get_current_user)):
+    """Universal AI writing assist for any text field in the app."""
+    ctx_bits = []
+    if body.ticker:
+        try:
+            profile = await company_profile(body.ticker, user)
+            quote = _fetch_quote(body.ticker)
+            ctx_bits.append(f"Context: {body.ticker.upper()} · {profile.get('name')} · {profile.get('sector')} · ${quote.get('price')} · P/E {profile.get('pe')}")
+        except Exception:
+            pass
+    action = body.instruction or "improve"
+    guide = {
+        "note":             "Rewrite this research note to be clearer, more analytical, and structured. Keep the same length ballpark.",
+        "thesis":           "Rewrite this investment thesis narrative to be sharp, evidence-anchored, and specific about the mechanism (why it works).",
+        "journal_reason":   "Rewrite this decision reason to be crisp and specific about the actual driver behind the buy/sell/hold.",
+        "journal_expected": "Rewrite this expected-outcome statement to be measurable (metric + timeframe + threshold).",
+        "catalyst":         "Suggest 3 concrete catalysts (dated where possible) as bullet points.",
+        "risk":             "Suggest 3 concrete risks (specific, not generic) as bullet points.",
+        "assumption":       "Rewrite this assumption into a testable, monitorable statement.",
+    }.get(body.context_type, "Improve the writing.")
+    prompt = f"{guide}\n\nAction: {action}.\n\nCurrent text:\n\"\"\"\n{body.current_text or '(empty)'}\n\"\"\"\n\nReturn ONLY the rewritten/generated text in the 'summary' field."
+    return await run_agent("note_assist", prompt, "\n".join(ctx_bits))
+
+
+@api.get("/market/brief")
+async def market_brief(user=Depends(get_current_user)):
+    overview = await market_overview(user)
+    ctx = "Market Indices: " + ", ".join([f"{i['label']} {i.get('change_pct',0):.2f}%" for i in overview["indices"] if i.get("change_pct") is not None])
+    result = await run_agent("market_brief",
+                             "Write today's AI Market Brief: What happened / Why it matters / Affected sectors / Risks / Opportunities.",
+                             ctx)
+    return {"brief": result, "as_of": now_iso()}
+
+@api.get("/portfolio/brief")
+async def portfolio_brief(user=Depends(get_current_user)):
+    port = await get_portfolio(user)
+    ctx = f"Portfolio value: ${port['total_value']:.0f}, gain: {port['total_gain_pct']:.2f}%. Holdings: " + ", ".join([f"{h['ticker']}({h['allocation']:.1f}%)" for h in port["holdings"][:10]])
+    result = await run_agent("portfolio_brief",
+                             "Write the daily portfolio brief: performance, key movers, risks, and one actionable insight.",
+                             ctx)
+    return {"brief": result, "as_of": now_iso()}
+
+
+# ---------------- Screener ----------------
+UNIVERSE = ["AAPL","MSFT","GOOGL","AMZN","NVDA","META","TSLA","AMD","NFLX","JPM","V","MA","UNH","XOM","JNJ","WMT","PG","BRK-B","HD","BAC","AVGO","COST","PEP","KO","CVX"]
+
+@api.post("/screener/run")
+async def screener_run(body: ScreenerBody, user=Depends(get_current_user)):
+    results = []
+    for t in UNIVERSE:
+        try:
+            p = _cache_get(f"profile:{t}", 3600)
+            if not p:
+                tk = yf.Ticker(t)
+                info = tk.info or {}
+                p = {"ticker": t, "name": info.get("shortName"), "sector": info.get("sector"),
+                     "market_cap": info.get("marketCap"), "pe": info.get("trailingPE"),
+                     "dividend_yield": info.get("dividendYield")}
+                _cache_set(f"profile:{t}", p)
+            q = _fetch_quote(t)
+            row = {**p, "price": q.get("price"), "change_pct": q.get("change_pct")}
+            if body.sector and (row.get("sector") or "").lower() != body.sector.lower():
+                continue
+            if body.min_market_cap and (row.get("market_cap") or 0) < body.min_market_cap:
+                continue
+            if body.max_pe and (row.get("pe") or 999) > body.max_pe:
+                continue
+            results.append(row)
+        except Exception:
+            continue
+
+    ai_summary = None
+    if body.query:
+        ai_summary = await run_agent("research",
+                                     f"User's natural-language screen: '{body.query}'. From the universe of tickers, which look most promising and why?",
+                                     "Universe: " + ",".join(UNIVERSE))
+    return {"results": results, "ai_summary": ai_summary}
+
+
+# ---------------- Valuation Lab ----------------
+@api.post("/valuation/dcf")
+async def dcf(body: DCFBody, user=Depends(get_current_user)):
+    fcf = body.revenue * body.margin
+    projections = []
+    total_pv = 0
+    for y in range(1, body.years + 1):
+        fcf_y = fcf * ((1 + body.growth_rate) ** y)
+        pv = fcf_y / ((1 + body.wacc) ** y)
+        projections.append({"year": y, "fcf": fcf_y, "pv": pv})
+        total_pv += pv
+    terminal_fcf = fcf * ((1 + body.growth_rate) ** body.years) * (1 + body.terminal_growth)
+    terminal_value = terminal_fcf / (body.wacc - body.terminal_growth) if body.wacc > body.terminal_growth else 0
+    pv_terminal = terminal_value / ((1 + body.wacc) ** body.years)
+    enterprise_value = total_pv + pv_terminal
+    fair_value_per_share = enterprise_value / body.shares_outstanding if body.shares_outstanding else 0
+
+    q = _fetch_quote(body.ticker)
+    current = q.get("price") or 0
+    upside = ((fair_value_per_share - current) / current * 100) if current else 0
+
+    return {
+        "ticker": body.ticker.upper(),
+        "projections": projections,
+        "terminal_value": terminal_value,
+        "pv_terminal": pv_terminal,
+        "enterprise_value": enterprise_value,
+        "fair_value_per_share": fair_value_per_share,
+        "current_price": current,
+        "upside_pct": upside,
+        "scenarios": {
+            "bull": {"fair_value": fair_value_per_share * 1.25, "upside_pct": upside + 25},
+            "base": {"fair_value": fair_value_per_share, "upside_pct": upside},
+            "bear": {"fair_value": fair_value_per_share * 0.75, "upside_pct": upside - 25},
+        }
+    }
+
+
+# ---------------- Documents (RAG with BM25 chunk retrieval) ----------------
+def _chunk_text(text: str, size: int = 700, overlap: int = 100) -> List[str]:
+    """Word-based chunker with overlap."""
+    words = text.split()
+    if not words:
+        return []
+    chunks = []
+    i = 0
+    while i < len(words):
+        chunks.append(" ".join(words[i:i + size]))
+        i += (size - overlap)
+    return chunks
+
+_TOKEN_RE = _re.compile(r"[A-Za-z0-9]+")
+def _tokenize(s: str) -> List[str]:
+    return [t.lower() for t in _TOKEN_RE.findall(s)]
+
+async def _bm25_retrieve(user_id: str, query: str, ticker: Optional[str] = None, top_k: int = 8) -> List[Dict[str, Any]]:
+    """Retrieve top-K chunks across user's documents using BM25 with fallback to all chunks."""
+    q = {"user_id": user_id}
+    if ticker:
+        q["ticker"] = ticker.upper()
+    chunks = await db.document_chunks.find(q, {"_id": 0}).to_list(5000)
+    if not chunks:
+        return []
+    corpus = [_tokenize(c["text"]) for c in chunks]
+    bm25 = BM25Okapi(corpus)
+    query_tokens = _tokenize(query) or ["contradiction", "risk", "guidance"]
+    scores = bm25.get_scores(query_tokens)
+    ranked = sorted(zip(chunks, scores), key=lambda x: x[1], reverse=True)
+    # Return top_k regardless of score (small corpora often score all near zero).
+    top = ranked[:top_k]
+    # If ALL scores are zero, keep them anyway — we still want to send chunks to the LLM.
+    return [{"chunk": c, "score": float(s)} for c, s in top]
+
+@api.post("/documents/upload")
+async def upload_doc(file: UploadFile = File(...), ticker: Optional[str] = None, user=Depends(get_current_user)):
+    content = await file.read()
+    text = ""
+    if file.filename.lower().endswith(".pdf"):
+        try:
+            from pypdf import PdfReader
+            import io
+            reader = PdfReader(io.BytesIO(content))
+            text = "\n".join([p.extract_text() or "" for p in reader.pages])
+        except Exception as e:
+            text = f"[PDF parse error: {e}]"
+    else:
+        try:
+            text = content.decode("utf-8", errors="ignore")
+        except Exception:
+            text = ""
+    doc_id = str(uuid.uuid4())
+    doc = {"doc_id": doc_id, "user_id": user["user_id"],
+           "filename": file.filename, "text": text[:200000],
+           "ticker": (ticker or "").upper() or None,
+           "size": len(content), "created_at": now_iso(),
+           "chunk_count": 0}
+    # chunk & store
+    chunks = _chunk_text(text[:200000])
+    chunk_docs = [{
+        "chunk_id": str(uuid.uuid4()), "doc_id": doc_id, "user_id": user["user_id"],
+        "filename": file.filename, "ticker": doc["ticker"],
+        "chunk_idx": i, "text": ch, "created_at": now_iso(),
+    } for i, ch in enumerate(chunks)]
+    doc["chunk_count"] = len(chunk_docs)
+    await db.documents.insert_one(doc)
+    if chunk_docs:
+        await db.document_chunks.insert_many(chunk_docs)
+    return {"doc_id": doc_id, "filename": file.filename, "chars": len(text), "chunks": len(chunk_docs)}
+
+@api.get("/documents")
+async def list_documents(user=Depends(get_current_user)):
+    docs = await db.documents.find({"user_id": user["user_id"]}, {"_id": 0, "text": 0}).sort("created_at", -1).to_list(100)
+    return docs
+
+@api.delete("/documents/{doc_id}")
+async def delete_document(doc_id: str, user=Depends(get_current_user)):
+    await db.documents.delete_one({"doc_id": doc_id, "user_id": user["user_id"]})
+    await db.document_chunks.delete_many({"doc_id": doc_id, "user_id": user["user_id"]})
+    return {"ok": True}
+
+@api.post("/documents/{doc_id}/ask")
+async def ask_doc(doc_id: str, body: Dict[str, Any], user=Depends(get_current_user)):
+    doc = await db.documents.find_one({"doc_id": doc_id, "user_id": user["user_id"]}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    question = body.get("question", "")
+    # BM25 retrieve within THIS doc for scoped question
+    chunks = await db.document_chunks.find({"doc_id": doc_id, "user_id": user["user_id"]}, {"_id": 0}).to_list(1000)
+    if chunks and question:
+        corpus = [_tokenize(c["text"]) for c in chunks]
+        bm25 = BM25Okapi(corpus)
+        scores = bm25.get_scores(_tokenize(question))
+        top = sorted(zip(chunks, scores), key=lambda x: x[1], reverse=True)[:5]
+        ctx_parts = [f"[chunk {c['chunk_idx']}] {c['text']}" for c, s in top if s > 0]
+        ctx = f"Document '{doc['filename']}':\n" + "\n\n".join(ctx_parts)
+    else:
+        ctx = f"Document '{doc['filename']}':\n{doc['text'][:8000]}"
+    return await run_agent("research", question, ctx)
+
+@api.post("/documents/contradiction")
+async def find_contradictions(body: Dict[str, Any], user=Depends(get_current_user)):
+    """Cross-document contradiction detection via BM25 chunk retrieval + LLM."""
+    ticker = body.get("ticker")
+    query = body.get("query") or "contradictions inconsistencies between guidance, financials, risk factors, and management statements"
+    hits = await _bm25_retrieve(user["user_id"], query, ticker=ticker, top_k=10)
+    if not hits:
+        return {"summary": "No document chunks found. Upload filings, transcripts, or presentations first.",
+                "evidence": [], "sources": [], "confidence": 0, "assumptions": [], "retrieved": 0}
+    # build context with citations
+    ctx_lines = []
+    sources_seen = set()
+    for h in hits:
+        c = h["chunk"]
+        tag = f"[{c['filename']} · chunk {c['chunk_idx']}]"
+        sources_seen.add(c["filename"])
+        ctx_lines.append(f"{tag}\n{c['text']}")
+    ctx = "\n\n---\n\n".join(ctx_lines)
+    prompt = ("Analyze these document excerpts and surface contradictions, inconsistencies, or "
+              "unresolved tensions between claims. Cite the source filename and chunk for each finding.")
+    result = await run_agent("contradiction", prompt, ctx)
+    result["retrieved"] = len(hits)
+    result["source_files"] = sorted(sources_seen)
+    return result
+
+
+# ---------------- Team ----------------
+@api.get("/team/members")
+async def list_team(user=Depends(get_current_user)):
+    members = await db.users.find({}, {"_id": 0, "password_hash": 0}).limit(20).to_list(20)
+    return members
+
+
+# ---------------- Knowledge Graph ----------------
+@api.get("/graph/{ticker}")
+async def get_graph(ticker: str, user=Depends(get_current_user)):
+    """Returns nodes/edges for React Flow."""
+    ticker = ticker.upper()
+    profile = await company_profile(ticker, user)
+    peers_map = {
+        "AAPL": ["MSFT","GOOGL","AMZN","META","NVDA"],
+        "MSFT": ["AAPL","GOOGL","AMZN","ORCL","CRM"],
+        "NVDA": ["AMD","INTC","TSM","QCOM","AVGO"],
+        "TSLA": ["F","GM","RIVN","NIO","LCID"],
+    }
+    peers = peers_map.get(ticker, ["MSFT","AAPL","GOOGL"])
+    nodes = [{"id": ticker, "type": "default", "position": {"x": 300, "y": 200}, "data": {"label": ticker}}]
+    edges = []
+    for i, p in enumerate(peers[:6]):
+        angle = (i / max(1, len(peers[:6]))) * 6.28
+        import math
+        nodes.append({"id": p, "type": "default",
+                      "position": {"x": 300 + 250 * math.cos(angle), "y": 200 + 250 * math.sin(angle)},
+                      "data": {"label": p}})
+        edges.append({"id": f"{ticker}-{p}", "source": ticker, "target": p, "label": "peer"})
+    sector = profile.get("sector") or "Sector"
+    nodes.append({"id": sector, "type": "default", "position": {"x": 300, "y": -20}, "data": {"label": sector}})
+    edges.append({"id": f"{ticker}-{sector}", "source": ticker, "target": sector, "label": "sector"})
+    return {"nodes": nodes, "edges": edges}
+
+
+# ---------------- Living Thesis (assumptions, catalysts, risks) ----------------
+class AssumptionBody(BaseModel):
+    text: str
+    kind: str = "business"  # business|competitive|financial|valuation|macro
+
+class LivingThesisBody(BaseModel):
+    ticker: str
+    stance: str  # bull|base|bear
+    headline: str
+    narrative: str
+    assumptions: List[AssumptionBody] = []
+    catalysts: List[str] = []
+    risks: List[str] = []
+    confidence: int = 60
+    price_target: Optional[float] = None
+    time_horizon_months: int = 12
+    parent_id: Optional[str] = None  # for versions
+
+@api.post("/thesis/living")
+async def create_living_thesis(body: LivingThesisBody, user=Depends(get_current_user)):
+    chain_id = None
+    version = 1
+    if body.parent_id:
+        parent = await db.living_theses.find_one({"thesis_id": body.parent_id, "user_id": user["user_id"]}, {"_id": 0})
+        if parent:
+            chain_id = parent.get("chain_id") or parent["thesis_id"]
+            latest = await db.living_theses.find({"chain_id": chain_id}).sort("version", -1).to_list(1)
+            version = (latest[0]["version"] + 1) if latest else 2
+    thesis_id = str(uuid.uuid4())
+    if not chain_id:
+        chain_id = thesis_id
+    doc = {
+        "thesis_id": thesis_id, "chain_id": chain_id, "version": version,
+        "user_id": user["user_id"], "ticker": body.ticker.upper(),
+        "stance": body.stance, "headline": body.headline, "narrative": body.narrative,
+        "assumptions": [{"assumption_id": str(uuid.uuid4()), "text": a.text, "kind": a.kind,
+                        "status": "intact", "last_checked": None, "reasoning": None} for a in body.assumptions],
+        "catalysts": body.catalysts, "risks": body.risks,
+        "confidence": body.confidence, "price_target": body.price_target,
+        "time_horizon_months": body.time_horizon_months,
+        "created_at": now_iso(),
+    }
+    await db.living_theses.insert_one(doc)
+    return {k: v for k, v in doc.items() if k != "_id"}
+
+@api.get("/thesis/living")
+async def list_living_theses(ticker: Optional[str] = None, user=Depends(get_current_user)):
+    q = {"user_id": user["user_id"]}
+    if ticker:
+        q["ticker"] = ticker.upper()
+    # latest per chain
+    all_docs = await db.living_theses.find(q, {"_id": 0}).sort("version", -1).to_list(500)
+    seen = set()
+    latest = []
+    for d in all_docs:
+        if d["chain_id"] not in seen:
+            seen.add(d["chain_id"])
+            latest.append(d)
+    return latest
+
+@api.get("/thesis/living/{thesis_id}")
+async def get_living_thesis(thesis_id: str, user=Depends(get_current_user)):
+    doc = await db.living_theses.find_one({"thesis_id": thesis_id, "user_id": user["user_id"]}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Not found")
+    return doc
+
+@api.get("/thesis/living/{thesis_id}/history")
+async def thesis_history(thesis_id: str, user=Depends(get_current_user)):
+    doc = await db.living_theses.find_one({"thesis_id": thesis_id, "user_id": user["user_id"]}, {"_id": 0})
+    if not doc: return []
+    chain_id = doc.get("chain_id") or thesis_id
+    return await db.living_theses.find({"chain_id": chain_id, "user_id": user["user_id"]}, {"_id": 0}).sort("version", 1).to_list(50)
+
+@api.post("/thesis/living/{thesis_id}/check")
+async def check_thesis(thesis_id: str, user=Depends(get_current_user)):
+    doc = await db.living_theses.find_one({"thesis_id": thesis_id, "user_id": user["user_id"]}, {"_id": 0})
+    if not doc: raise HTTPException(status_code=404, detail="Not found")
+    profile = await company_profile(doc["ticker"], user)
+    quote = _fetch_quote(doc["ticker"])
+    ctx = f"Ticker {doc['ticker']} · {profile.get('name')} · Sector {profile.get('sector')} · Price ${quote.get('price')} · P/E {profile.get('pe')} · 52w range {profile.get('52w_low')}-{profile.get('52w_high')}. Business: {(profile.get('summary') or '')[:400]}."
+    updated_assumptions = []
+    for a in doc.get("assumptions", []):
+        prompt = f"Assumption ({a['kind']}): '{a['text']}'. Determine current status. Return summary explaining status. In evidence array, list 2-3 concrete data points. In assumptions field, put your final verdict: exactly one of 'INTACT', 'AT_RISK', or 'BROKEN'."
+        res = await run_agent("assumption_check", prompt, ctx)
+        # heuristics: parse status from assumptions[0] or from summary
+        verdict = "intact"
+        blob = " ".join(res.get("assumptions", []) + [res.get("summary", "")]).upper()
+        if "BROKEN" in blob:
+            verdict = "broken"
+        elif "AT_RISK" in blob or "AT RISK" in blob:
+            verdict = "at_risk"
+        updated_assumptions.append({**a, "status": verdict, "last_checked": now_iso(), "reasoning": res.get("summary", "")})
+    await db.living_theses.update_one({"thesis_id": thesis_id}, {"$set": {"assumptions": updated_assumptions, "last_checked": now_iso()}})
+    return {"assumptions": updated_assumptions, "checked_at": now_iso()}
+
+@api.get("/thesis/living/{thesis_id}/diff")
+async def thesis_diff(thesis_id: str, user=Depends(get_current_user)):
+    doc = await db.living_theses.find_one({"thesis_id": thesis_id, "user_id": user["user_id"]}, {"_id": 0})
+    if not doc: raise HTTPException(status_code=404, detail="Not found")
+    chain = await db.living_theses.find({"chain_id": doc.get("chain_id", thesis_id)}, {"_id": 0}).sort("version", 1).to_list(50)
+    if len(chain) < 2:
+        return {"changes": [], "message": "No prior version"}
+    prev, curr = chain[-2], chain[-1]
+    changes = []
+    def compare_list(field):
+        p_items = [x["text"] if isinstance(x, dict) else x for x in prev.get(field, [])]
+        c_items = [x["text"] if isinstance(x, dict) else x for x in curr.get(field, [])]
+        added = [x for x in c_items if x not in p_items]
+        removed = [x for x in p_items if x not in c_items]
+        for x in added: changes.append({"field": field, "type": "added", "value": x})
+        for x in removed: changes.append({"field": field, "type": "removed", "value": x})
+    compare_list("assumptions")
+    compare_list("catalysts")
+    compare_list("risks")
+    for f in ["headline","narrative","stance","confidence","price_target"]:
+        if prev.get(f) != curr.get(f):
+            changes.append({"field": f, "type": "changed", "from": prev.get(f), "to": curr.get(f)})
+    return {"changes": changes, "prev_version": prev["version"], "curr_version": curr["version"]}
+
+
+# ---------------- Decision Journal ----------------
+class JournalEntryBody(BaseModel):
+    ticker: str
+    action: str  # buy|sell|hold|watch
+    decision_reason: str
+    expected_outcome: str
+    expected_timeframe_months: int = 12
+    confidence: int = 60
+    price_at_decision: Optional[float] = None
+
+class PostMortemBody(BaseModel):
+    result_outcome: str  # right|wrong|partial
+    result_summary: str
+    lessons: List[str] = []
+
+@api.get("/journal")
+async def list_journal(user=Depends(get_current_user)):
+    entries = await db.journal_entries.find({"user_id": user["user_id"]}, {"_id": 0}).sort("created_at", -1).to_list(200)
+    return entries
+
+@api.post("/journal")
+async def create_journal(body: JournalEntryBody, user=Depends(get_current_user)):
+    price = body.price_at_decision
+    if price is None:
+        q = _fetch_quote(body.ticker)
+        price = q.get("price")
+    entry = {
+        "entry_id": str(uuid.uuid4()), "user_id": user["user_id"],
+        "ticker": body.ticker.upper(), "action": body.action,
+        "decision_reason": body.decision_reason, "expected_outcome": body.expected_outcome,
+        "expected_timeframe_months": body.expected_timeframe_months,
+        "confidence": body.confidence, "price_at_decision": price,
+        "result_outcome": None, "result_summary": None, "lessons": [],
+        "created_at": now_iso(), "resolved_at": None,
+    }
+    await db.journal_entries.insert_one(entry)
+    return {k: v for k, v in entry.items() if k != "_id"}
+
+@api.post("/journal/{entry_id}/postmortem")
+async def add_postmortem(entry_id: str, body: PostMortemBody, user=Depends(get_current_user)):
+    await db.journal_entries.update_one(
+        {"entry_id": entry_id, "user_id": user["user_id"]},
+        {"$set": {"result_outcome": body.result_outcome, "result_summary": body.result_summary,
+                  "lessons": body.lessons, "resolved_at": now_iso()}}
+    )
+    return {"ok": True}
+
+@api.delete("/journal/{entry_id}")
+async def delete_journal(entry_id: str, user=Depends(get_current_user)):
+    await db.journal_entries.delete_one({"entry_id": entry_id, "user_id": user["user_id"]})
+    return {"ok": True}
+
+@api.get("/journal/analyze")
+async def analyze_journal(user=Depends(get_current_user)):
+    entries = await db.journal_entries.find({"user_id": user["user_id"]}, {"_id": 0}).to_list(500)
+    if not entries:
+        return {"summary": "No journal entries yet.", "evidence": [], "sources": [], "confidence": 0, "assumptions": []}
+    summary = []
+    for e in entries[:50]:
+        line = f"{e['action'].upper()} {e['ticker']} @ ${e.get('price_at_decision','?')} · conf {e['confidence']}% · reason: {e['decision_reason'][:120]}"
+        if e.get("result_outcome"):
+            line += f" · OUTCOME: {e['result_outcome']}"
+        summary.append(line)
+    ctx = "Journal entries:\n" + "\n".join(summary)
+    return await run_agent("bias", "Identify recurring biases and blind spots in these investment decisions. Concrete, specific, actionable.", ctx)
+
+
+# ---------------- Investment CRM Pipeline ----------------
+STAGES = ["idea","research","validation","buy","monitor","review","archive"]
+
+class PipelineAddBody(BaseModel):
+    ticker: str
+    stage: str = "idea"
+    note: Optional[str] = ""
+    thesis_headline: Optional[str] = None
+
+class PipelineMoveBody(BaseModel):
+    item_id: str
+    new_stage: str
+    note: Optional[str] = None
+
+@api.get("/pipeline")
+async def get_pipeline(user=Depends(get_current_user)):
+    items = await db.pipeline_items.find({"user_id": user["user_id"]}, {"_id": 0}).sort("updated_at", -1).to_list(500)
+    grouped = {s: [] for s in STAGES}
+    for it in items:
+        s = it.get("stage") if it.get("stage") in STAGES else "idea"
+        # attach current price
+        q = _fetch_quote(it["ticker"])
+        it["price"] = q.get("price")
+        it["change_pct"] = q.get("change_pct")
+        grouped[s].append(it)
+    return {"stages": STAGES, "items": grouped}
+
+@api.post("/pipeline")
+async def add_pipeline(body: PipelineAddBody, user=Depends(get_current_user)):
+    if body.stage not in STAGES:
+        raise HTTPException(status_code=400, detail="Invalid stage")
+    item = {
+        "item_id": str(uuid.uuid4()), "user_id": user["user_id"],
+        "ticker": body.ticker.upper(), "stage": body.stage,
+        "note": body.note or "", "thesis_headline": body.thesis_headline,
+        "history": [{"stage": body.stage, "at": now_iso(), "note": body.note or ""}],
+        "created_at": now_iso(), "updated_at": now_iso(),
+    }
+    await db.pipeline_items.insert_one(item)
+    return {k: v for k, v in item.items() if k != "_id"}
+
+@api.post("/pipeline/move")
+async def move_pipeline(body: PipelineMoveBody, user=Depends(get_current_user)):
+    if body.new_stage not in STAGES:
+        raise HTTPException(status_code=400, detail="Invalid stage")
+    await db.pipeline_items.update_one(
+        {"item_id": body.item_id, "user_id": user["user_id"]},
+        {"$set": {"stage": body.new_stage, "updated_at": now_iso()},
+         "$push": {"history": {"stage": body.new_stage, "at": now_iso(), "note": body.note or ""}}}
+    )
+    return {"ok": True}
+
+@api.delete("/pipeline/{item_id}")
+async def delete_pipeline(item_id: str, user=Depends(get_current_user)):
+    await db.pipeline_items.delete_one({"item_id": item_id, "user_id": user["user_id"]})
+    return {"ok": True}
+
+
+# ---------------- Portfolio Intelligence (hidden connections + macro) ----------------
+@api.get("/portfolio/connections")
+async def portfolio_connections(user=Depends(get_current_user)):
+    holdings = await db.holdings.find({"user_id": user["user_id"]}, {"_id": 0}).to_list(200)
+    if not holdings:
+        return {"summary": "No holdings.", "evidence": [], "sources": [], "confidence": 0, "assumptions": []}
+    ctx_lines = []
+    for h in holdings:
+        p = _cache_get(f"profile:{h['ticker']}", 3600)
+        if not p:
+            try:
+                tk = yf.Ticker(h["ticker"])
+                info = tk.info or {}
+                p = {"sector": info.get("sector"), "industry": info.get("industry")}
+                _cache_set(f"profile:{h['ticker']}", p)
+            except Exception:
+                p = {}
+        ctx_lines.append(f"{h['ticker']} · {p.get('sector','?')} · {p.get('industry','?')}")
+    ctx = "Holdings:\n" + "\n".join(ctx_lines)
+    return await run_agent("hidden_connections",
+                           "Identify 3-6 hidden thesis clusters that group these holdings by underlying business drivers, not sectors. In evidence, list each cluster as 'ClusterName: TICKER1, TICKER2, ...'. In assumptions, list the shared driver for each cluster.",
+                           ctx)
+
+@api.get("/portfolio/macro")
+async def portfolio_macro(user=Depends(get_current_user)):
+    holdings = await db.holdings.find({"user_id": user["user_id"]}, {"_id": 0}).to_list(200)
+    if not holdings:
+        return {"exposures": [], "summary": "No holdings."}
+    tickers = ", ".join(sorted({h["ticker"] for h in holdings}))
+    ctx = f"Portfolio tickers: {tickers}. Total holdings: {len(holdings)}."
+    result = await run_agent("macro_exposure",
+                             "Score portfolio's exposure (0-100) to each of: interest_rates, oil, china, ai, semiconductors, inflation, housing, defense, consumer. Return the scores in the assumptions field as 'factor:score' one per line.",
+                             ctx)
+    # parse
+    exposures = []
+    for line in result.get("assumptions", []):
+        if ":" in line:
+            k, v = line.split(":", 1)
+            try:
+                exposures.append({"factor": k.strip().lower().replace(" ", "_"), "score": int(''.join([c for c in v if c.isdigit()]) or 0)})
+            except Exception:
+                continue
+    return {"exposures": exposures, "summary": result.get("summary"), "confidence": result.get("confidence", 60), "raw": result}
+
+
+# ---------------- Investment Timeline ----------------
+@api.get("/timeline/{ticker}")
+async def timeline(ticker: str, user=Depends(get_current_user)):
+    T = ticker.upper()
+    events = []
+    # news
+    news = await company_news(ticker, user)
+    for n in news:
+        events.append({"type": "news", "title": n.get("title"), "meta": n.get("publisher"),
+                       "link": n.get("link"), "at": now_iso()})
+    # journal
+    journal = await db.journal_entries.find({"user_id": user["user_id"], "ticker": T}, {"_id": 0}).to_list(100)
+    for j in journal:
+        events.append({"type": f"journal_{j['action']}", "title": j["decision_reason"][:140],
+                       "meta": f"conf {j['confidence']}%", "at": j["created_at"]})
+    # thesis versions
+    theses = await db.living_theses.find({"user_id": user["user_id"], "ticker": T}, {"_id": 0}).to_list(100)
+    for t in theses:
+        events.append({"type": "thesis", "title": f"v{t['version']} · {t['headline']}",
+                       "meta": t["stance"].upper(), "at": t["created_at"]})
+    events.sort(key=lambda e: e.get("at") or "", reverse=True)
+    return {"ticker": T, "events": events[:80]}
+
+
+# ---------------- Background Scheduler (auto assumption re-check) ----------------
+scheduler = AsyncIOScheduler(timezone="UTC")
+
+async def _check_earnings_signal(ticker: str) -> Dict[str, Any]:
+    """Return whether an earnings/material signal happened recently for a ticker."""
+    keywords = ("earnings", "quarter", "guidance", "beats", "misses", "revenue", "eps", "outlook")
+    try:
+        tk = yf.Ticker(ticker)
+        news_list = tk.news or []
+        for n in news_list[:15]:
+            title = (n.get("title") or (n.get("content") or {}).get("title") or "").lower()
+            if any(k in title for k in keywords):
+                return {"signal": True, "reason": "news_earnings", "headline": title}
+    except Exception:
+        pass
+    # price move signal
+    try:
+        hist = yf.Ticker(ticker).history(period="5d")
+        if len(hist) >= 2:
+            last = float(hist["Close"].iloc[-1])
+            prev = float(hist["Close"].iloc[-2])
+            move = abs((last - prev) / prev * 100) if prev else 0
+            if move >= 5:
+                return {"signal": True, "reason": "price_move", "move_pct": move}
+    except Exception:
+        pass
+    return {"signal": False}
+
+async def _run_thesis_check_internal(thesis_id: str, user_id: str, reason: str = "auto"):
+    """Reusable internal check (mirrors /thesis/living/{id}/check without HTTPException auth)."""
+    doc = await db.living_theses.find_one({"thesis_id": thesis_id, "user_id": user_id}, {"_id": 0})
+    if not doc:
+        return None
+    try:
+        # fetch profile/quote directly (bypassing Depends)
+        profile_cached = _cache_get(f"profile:{doc['ticker']}", 3600)
+        if not profile_cached:
+            try:
+                info = yf.Ticker(doc["ticker"]).info or {}
+                profile_cached = {"name": info.get("shortName"), "sector": info.get("sector"),
+                                  "pe": info.get("trailingPE"), "summary": info.get("longBusinessSummary")}
+                _cache_set(f"profile:{doc['ticker']}", profile_cached)
+            except Exception:
+                profile_cached = {}
+        quote = _fetch_quote(doc["ticker"])
+        ctx = f"Ticker {doc['ticker']} · {profile_cached.get('name')} · Sector {profile_cached.get('sector')} · Price ${quote.get('price')} · Trigger: {reason}. Business: {(profile_cached.get('summary') or '')[:400]}."
+        updated = []
+        for a in doc.get("assumptions", []):
+            prompt = f"Assumption ({a['kind']}): '{a['text']}'. Determine status. In assumptions field return exactly one of 'INTACT','AT_RISK','BROKEN'."
+            res = await run_agent("assumption_check", prompt, ctx)
+            blob = " ".join(res.get("assumptions", []) + [res.get("summary", "")]).upper()
+            verdict = "broken" if "BROKEN" in blob else ("at_risk" if ("AT_RISK" in blob or "AT RISK" in blob) else "intact")
+            updated.append({**a, "status": verdict, "last_checked": now_iso(), "reasoning": res.get("summary", "")})
+        await db.living_theses.update_one({"thesis_id": thesis_id}, {"$set": {"assumptions": updated, "last_checked": now_iso(), "last_check_reason": reason}})
+        at_risk = sum(1 for u in updated if u["status"] == "at_risk")
+        broken = sum(1 for u in updated if u["status"] == "broken")
+        # audit
+        await db.scheduler_runs.insert_one({
+            "run_id": str(uuid.uuid4()), "thesis_id": thesis_id, "user_id": user_id,
+            "ticker": doc["ticker"], "reason": reason, "at": now_iso(),
+            "at_risk_count": at_risk, "broken_count": broken,
+        })
+        # notify if any assumption compromised
+        if at_risk > 0 or broken > 0:
+            severity = "BROKEN" if broken > 0 else "AT-RISK"
+            title = f"{severity}: {doc['ticker']} thesis — {broken} broken, {at_risk} at risk"
+            body = (f"Auto-check triggered by <b>{reason}</b> flagged assumptions in your <b>{doc['ticker']}</b> "
+                    f"thesis (v{doc.get('version', 1)}, {doc.get('stance','').upper()}). "
+                    f"Open the thesis to review.")
+            await _create_notification(user_id, title, body, kind="thesis_alert",
+                                       meta={"ticker": doc["ticker"], "thesis_id": thesis_id,
+                                             "at_risk": at_risk, "broken": broken, "reason": reason})
+        return updated
+    except Exception as e:
+        logger.error(f"scheduler check failed for {thesis_id}: {e}")
+        return None
+
+async def thesis_auto_recheck_job():
+    """Runs periodically. For each latest-version living thesis, if a material signal (earnings news
+    or >=5% price move) is detected for the ticker, run the assumption check."""
+    logger.info("scheduler: starting thesis auto-recheck")
+    all_theses = await db.living_theses.find({}, {"_id": 0}).sort("version", -1).to_list(5000)
+    seen_chains = set()
+    latest = []
+    for t in all_theses:
+        chain = t.get("chain_id") or t["thesis_id"]
+        if chain in seen_chains:
+            continue
+        seen_chains.add(chain)
+        latest.append(t)
+    checked = 0
+    for t in latest:
+        signal = await _check_earnings_signal(t["ticker"])
+        if signal.get("signal"):
+            await _run_thesis_check_internal(t["thesis_id"], t["user_id"], reason=signal.get("reason", "auto"))
+            checked += 1
+    logger.info(f"scheduler: checked {checked}/{len(latest)} theses")
+
+@api.get("/scheduler/status")
+async def scheduler_status(user=Depends(get_current_user)):
+    jobs = [{"id": j.id, "next_run": str(j.next_run_time)} for j in scheduler.get_jobs()]
+    runs = await db.scheduler_runs.find({"user_id": user["user_id"]}, {"_id": 0}).sort("at", -1).to_list(50)
+    return {"jobs": jobs, "recent_runs": runs}
+
+@api.post("/scheduler/run-now")
+async def scheduler_run_now(user=Depends(get_current_user)):
+    """Manually trigger the auto-recheck for the current user's theses only (fast path)."""
+    theses = await db.living_theses.find({"user_id": user["user_id"]}, {"_id": 0}).sort("version", -1).to_list(500)
+    seen = set()
+    latest = []
+    for t in theses:
+        chain = t.get("chain_id") or t["thesis_id"]
+        if chain in seen: continue
+        seen.add(chain); latest.append(t)
+    triggered = []
+    for t in latest:
+        signal = await _check_earnings_signal(t["ticker"])
+        if signal.get("signal"):
+            await _run_thesis_check_internal(t["thesis_id"], t["user_id"], reason=signal.get("reason", "manual"))
+            triggered.append({"ticker": t["ticker"], "reason": signal.get("reason")})
+    return {"scanned": len(latest), "triggered": triggered}
+
+
+# ---------------- Demo Seed ----------------
+DEMO_JOURNAL = [
+    {"ticker":"NVDA","action":"buy","decision_reason":"AI infra demand looks unstoppable; Blackwell ramp + data-center capex from hyperscalers underpins revenue.","expected_outcome":"Revenue growth >40% next 4 quarters, stock re-rates to 40x fwd.","expected_timeframe_months":18,"confidence":80},
+    {"ticker":"TSLA","action":"sell","decision_reason":"FSD progress overhyped; EV competition intensifying; margins compressing.","expected_outcome":"Multiple contracts as auto-margin story fades.","expected_timeframe_months":12,"confidence":65},
+    {"ticker":"AAPL","action":"hold","decision_reason":"Services growth intact but iPhone units flattening; waiting for AI Siri catalyst.","expected_outcome":"Sideways action until WWDC.","expected_timeframe_months":9,"confidence":55},
+    {"ticker":"AMD","action":"buy","decision_reason":"MI300 traction better than expected; taking share in AI accelerators.","expected_outcome":"Data-center revenue doubles within 18mo.","expected_timeframe_months":15,"confidence":70},
+    {"ticker":"META","action":"buy","decision_reason":"Reels monetization plus AI targeting; capex bloat is temporary.","expected_outcome":"Op margin recovers to 40%+.","expected_timeframe_months":24,"confidence":72},
+    {"ticker":"GOOGL","action":"watch","decision_reason":"Search moat under real AI threat for first time; watching Gemini reception.","expected_outcome":"Determine buy vs skip by end of quarter.","expected_timeframe_months":3,"confidence":50},
+]
+DEMO_PIPELINE = [
+    ("PLTR","idea","AI + govt tailwind, but valuation stretched"),
+    ("SHOP","idea","E-commerce recovery play"),
+    ("SNOW","research","Consumption model showing durability"),
+    ("CRWD","research","Cyber consolidation winner"),
+    ("MDB","validation","Vector search moat vs Elastic"),
+    ("ANET","validation","AI networking silent winner"),
+    ("NVDA","buy","AI infrastructure king · 8% position"),
+    ("META","monitor","Ad growth + Reels · watching margin path"),
+    ("AAPL","monitor","Services + WWDC catalyst"),
+    ("PYPL","review","Thesis broken · execution poor"),
+    ("PTON","archive","Failed turnaround"),
+]
+
+@api.post("/demo/seed")
+async def demo_seed(user=Depends(get_current_user)):
+    """Idempotent-ish seed: adds demo journal + pipeline entries for the current user."""
+    j_added, p_added = 0, 0
+    for d in DEMO_JOURNAL:
+        q = _fetch_quote(d["ticker"])
+        entry = {
+            "entry_id": str(uuid.uuid4()), "user_id": user["user_id"],
+            "ticker": d["ticker"], "action": d["action"],
+            "decision_reason": d["decision_reason"], "expected_outcome": d["expected_outcome"],
+            "expected_timeframe_months": d["expected_timeframe_months"],
+            "confidence": d["confidence"], "price_at_decision": q.get("price"),
+            "result_outcome": None, "result_summary": None, "lessons": [],
+            "created_at": now_iso(), "resolved_at": None, "demo": True,
+        }
+        await db.journal_entries.insert_one(entry)
+        j_added += 1
+    for tk, stage, note in DEMO_PIPELINE:
+        item = {
+            "item_id": str(uuid.uuid4()), "user_id": user["user_id"],
+            "ticker": tk, "stage": stage, "note": note, "thesis_headline": None,
+            "history": [{"stage": stage, "at": now_iso(), "note": note}],
+            "created_at": now_iso(), "updated_at": now_iso(), "demo": True,
+        }
+        await db.pipeline_items.insert_one(item)
+        p_added += 1
+    return {"journal_added": j_added, "pipeline_added": p_added}
+
+@api.post("/demo/clear")
+async def demo_clear(user=Depends(get_current_user)):
+    j = await db.journal_entries.delete_many({"user_id": user["user_id"], "demo": True})
+    p = await db.pipeline_items.delete_many({"user_id": user["user_id"], "demo": True})
+    return {"journal_cleared": j.deleted_count, "pipeline_cleared": p.deleted_count}
+
+
+
+@api.get("/")
 async def root():
-    return {"message": "Hello World"}
+    return {"service": "IntelligenceOS", "status": "ok", "time": now_iso()}
 
-@api_router.post("/status", response_model=StatusCheck)
-async def create_status_check(input: StatusCheckCreate):
-    status_dict = input.model_dump()
-    status_obj = StatusCheck(**status_dict)
-    
-    # Convert to dict and serialize datetime to ISO string for MongoDB
-    doc = status_obj.model_dump()
-    doc['timestamp'] = doc['timestamp'].isoformat()
-    
-    _ = await db.status_checks.insert_one(doc)
-    return status_obj
 
-@api_router.get("/status", response_model=List[StatusCheck])
-async def get_status_checks():
-    # Exclude MongoDB's _id field from the query results
-    status_checks = await db.status_checks.find({}, {"_id": 0}).to_list(1000)
-    
-    # Convert ISO string timestamps back to datetime objects
-    for check in status_checks:
-        if isinstance(check['timestamp'], str):
-            check['timestamp'] = datetime.fromisoformat(check['timestamp'])
-    
-    return status_checks
+# ---------------- Attractiveness Score & Ratings ----------------
+def _score_from(value: Optional[float], best: float, worst: float) -> Optional[float]:
+    """Linear scale value between best and worst → 0..100 (best→100). Returns None if value missing."""
+    if value is None:
+        return None
+    if best == worst:
+        return 50.0
+    v = max(min(value, max(best, worst)), min(best, worst))
+    return round(((v - worst) / (best - worst)) * 100, 1) if best > worst else round(((worst - v) / (worst - best)) * 100, 1)
 
-# Include the router in the main app
-app.include_router(api_router)
+def _compute_score(profile: Dict[str, Any], quote: Dict[str, Any]) -> Dict[str, Any]:
+    """Compute a 0-100 attractiveness score with sub-scores. No AI — deterministic."""
+    pe = profile.get("pe")
+    fwd_pe = profile.get("forward_pe")
+    beta = profile.get("beta")
+    hi = profile.get("52w_high"); lo = profile.get("52w_low")
+    price = quote.get("price")
+    change_pct = quote.get("change_pct") or 0
 
+    # Value: lower PE is better (10 best, 60 worst). If missing use fwd_pe.
+    use_pe = pe if pe and 0 < pe < 200 else (fwd_pe if fwd_pe and 0 < fwd_pe < 200 else None)
+    value_score = _score_from(use_pe, best=10, worst=50)
+    if value_score is None: value_score = 50
+
+    # Momentum: position within 52w range (higher = strong; but not overheated)
+    momentum_score = 50
+    if price and hi and lo and hi > lo:
+        pos = (price - lo) / (hi - lo)  # 0..1
+        # sweet spot: 0.4 - 0.8. Overheated >0.9, weak <0.2
+        if pos <= 0.9:
+            momentum_score = round(pos * 100, 1)
+        else:
+            momentum_score = round(90 - (pos - 0.9) * 200, 1)  # penalize overheated
+        momentum_score = max(0, min(100, momentum_score))
+
+    # Quality: lower beta closer to 1 preferred; dividend yield positive; add if divYield exists
+    quality_score = 50
+    if beta is not None:
+        quality_score = 100 - min(100, abs(beta - 1) * 60)
+    if profile.get("dividend_yield"):
+        quality_score = min(100, quality_score + 10)
+
+    # Sentiment: today's change
+    sentiment_score = max(0, min(100, 50 + change_pct * 4))
+
+    overall = round((value_score * 0.35 + momentum_score * 0.25 + quality_score * 0.25 + sentiment_score * 0.15), 1)
+    if overall >= 75: rating = "STRONG_BUY"
+    elif overall >= 60: rating = "BUY"
+    elif overall >= 45: rating = "HOLD"
+    elif overall >= 30: rating = "SELL"
+    else: rating = "STRONG_SELL"
+
+    return {
+        "overall": overall,
+        "rating": rating,
+        "components": {
+            "value": round(value_score, 1),
+            "momentum": round(momentum_score, 1),
+            "quality": round(quality_score, 1),
+            "sentiment": round(sentiment_score, 1),
+        },
+        "signals": {
+            "pe": use_pe,
+            "range_position_pct": round((price - lo) / (hi - lo) * 100, 1) if (price and hi and lo and hi > lo) else None,
+            "beta": beta,
+            "change_pct": change_pct,
+        }
+    }
+
+@api.get("/company/{ticker}/score")
+async def company_score(ticker: str, user=Depends(get_current_user)):
+    profile = await company_profile(ticker, user)
+    quote = _fetch_quote(ticker)
+    score = _compute_score(profile, quote)
+    return {"ticker": ticker.upper(), "name": profile.get("name"), "sector": profile.get("sector"),
+            "price": quote.get("price"), "change_pct": quote.get("change_pct"), **score,
+            "as_of": now_iso()}
+
+class RatingsBody(BaseModel):
+    tickers: List[str]
+    ai_rationale: bool = False
+
+@api.post("/ratings")
+async def bulk_ratings(body: RatingsBody, user=Depends(get_current_user)):
+    """Return attractiveness score + rating for a list of tickers. Optionally add AI one-liner."""
+    rows = []
+    for t in body.tickers[:50]:
+        try:
+            profile = await company_profile(t, user)
+            quote = _fetch_quote(t)
+            score = _compute_score(profile, quote)
+            row = {"ticker": t.upper(), "name": profile.get("name"), "sector": profile.get("sector"),
+                   "price": quote.get("price"), "change_pct": quote.get("change_pct"), **score}
+            if body.ai_rationale:
+                ctx = f"Ticker {t} · price ${quote.get('price')} · PE {profile.get('pe')} · sector {profile.get('sector')} · overall {score['overall']} · rating {score['rating']}"
+                r = await run_agent("research", "In one sentence, justify the rating.", ctx)
+                row["ai_rationale"] = r.get("summary", "")
+            rows.append(row)
+        except Exception as e:
+            logger.warning(f"ratings failed for {t}: {e}")
+            continue
+    return {"ratings": rows, "as_of": now_iso()}
+
+
+# ---------------- Email (Resend) ----------------
+def _email_html(title: str, body: str, cta_url: Optional[str] = None, cta_text: Optional[str] = None) -> str:
+    """Inline-CSS HTML template (email-client safe)."""
+    cta_block = ""
+    if cta_url and cta_text:
+        cta_block = (f'<tr><td style="padding: 24px 0 0 0;">'
+                     f'<a href="{cta_url}" style="background:#F97316;color:#000;padding:12px 24px;'
+                     f'text-decoration:none;border-radius:6px;font-family:system-ui,sans-serif;'
+                     f'font-size:14px;font-weight:600;display:inline-block;">{cta_text}</a>'
+                     f'</td></tr>')
+    return f"""<!DOCTYPE html>
+<html><body style="margin:0;padding:0;background:#090A0C;font-family:system-ui,-apple-system,sans-serif;">
+<table role="presentation" cellspacing="0" cellpadding="0" width="100%" style="padding:32px 0;">
+  <tr><td align="center">
+    <table role="presentation" cellspacing="0" cellpadding="0" width="600" style="max-width:600px;background:#121418;border:1px solid #22262E;border-radius:8px;">
+      <tr><td style="padding:24px 32px;border-bottom:1px solid #22262E;">
+        <div style="display:inline-block;width:24px;height:24px;background:#F97316;border-radius:4px;text-align:center;line-height:24px;font-weight:900;color:#000;">⚡</div>
+        <span style="margin-left:8px;color:#F3F4F6;font-weight:600;font-size:15px;">IntelligenceOS</span>
+      </td></tr>
+      <tr><td style="padding:32px;">
+        <h1 style="color:#F3F4F6;font-size:22px;font-weight:300;margin:0 0 16px 0;letter-spacing:-0.02em;">{title}</h1>
+        <div style="color:#9CA3AF;font-size:14px;line-height:1.6;">{body}</div>
+        <table role="presentation" cellspacing="0" cellpadding="0">{cta_block}</table>
+      </td></tr>
+      <tr><td style="padding:16px 32px;border-top:1px solid #22262E;color:#6B7280;font-size:11px;font-family:'Courier New',monospace;">
+        Not investment advice. <a href="#" style="color:#6B7280;">Manage preferences</a>
+      </td></tr>
+    </table>
+  </td></tr>
+</table></body></html>"""
+
+async def _send_email(to_email: str, subject: str, html: str) -> Dict[str, Any]:
+    """Non-blocking Resend send. Returns {sent:bool, id?, error?}."""
+    resend_key = os.environ.get("RESEND_API_KEY")
+    if not resend_key:
+        return {"sent": False, "error": "RESEND_API_KEY not configured"}
+    try:
+        import resend
+        resend.api_key = resend_key
+        params = {
+            "from": os.environ.get("RESEND_FROM", "IntelligenceOS <onboarding@resend.dev>"),
+            "to": [to_email], "subject": subject, "html": html,
+        }
+        result = await asyncio.to_thread(resend.Emails.send, params)
+        return {"sent": True, "id": result.get("id")}
+    except Exception as e:
+        logger.warning(f"resend send failed: {e}")
+        return {"sent": False, "error": str(e)[:200]}
+
+async def _get_email_prefs(user_id: str) -> Dict[str, Any]:
+    prefs = await db.email_prefs.find_one({"user_id": user_id}, {"_id": 0})
+    if not prefs:
+        prefs = {"user_id": user_id, "thesis_alerts": True, "weekly_digest": True,
+                 "product_updates": False, "created_at": now_iso()}
+        await db.email_prefs.insert_one(prefs)
+        prefs.pop("_id", None)
+    return prefs
+async def _create_notification(user_id: str, title: str, body: str, kind: str, meta: Dict[str, Any] = None):
+    doc = {
+        "notification_id": str(uuid.uuid4()), "user_id": user_id,
+        "title": title, "body": body, "kind": kind,
+        "meta": meta or {}, "read": False, "created_at": now_iso(),
+    }
+    await db.notifications.insert_one(doc)
+    # Honor per-user email prefs
+    try:
+        prefs = await _get_email_prefs(user_id)
+        wants_email = prefs.get("thesis_alerts", True) if kind == "thesis_alert" else True
+        if wants_email:
+            user = await db.users.find_one({"user_id": user_id}, {"_id": 0})
+            if user and user.get("email"):
+                cta_url = None
+                if meta and meta.get("ticker"):
+                    cta_url = f"{os.environ.get('APP_URL', '')}/company/{meta['ticker']}"
+                html = _email_html(title, body, cta_url, "Open in IntelligenceOS" if cta_url else None)
+                await _send_email(user["email"], title, html)
+    except Exception as e:
+        logger.warning(f"email dispatch failed: {e}")
+    return {k: v for k, v in doc.items() if k != "_id"}
+
+@api.get("/notifications")
+async def list_notifications(unread_only: bool = False, user=Depends(get_current_user)):
+    q = {"user_id": user["user_id"]}
+    if unread_only: q["read"] = False
+    items = await db.notifications.find(q, {"_id": 0}).sort("created_at", -1).to_list(100)
+    unread = await db.notifications.count_documents({"user_id": user["user_id"], "read": False})
+    return {"notifications": items, "unread_count": unread}
+
+@api.post("/notifications/{nid}/read")
+async def mark_read(nid: str, user=Depends(get_current_user)):
+    await db.notifications.update_one({"notification_id": nid, "user_id": user["user_id"]},
+                                      {"$set": {"read": True, "read_at": now_iso()}})
+    return {"ok": True}
+
+@api.post("/notifications/read-all")
+async def mark_all_read(user=Depends(get_current_user)):
+    await db.notifications.update_many({"user_id": user["user_id"], "read": False},
+                                       {"$set": {"read": True, "read_at": now_iso()}})
+    return {"ok": True}
+
+
+# ---------------- Email Preferences & Test/Digest ----------------
+class EmailPrefsBody(BaseModel):
+    thesis_alerts: Optional[bool] = None
+    weekly_digest: Optional[bool] = None
+    product_updates: Optional[bool] = None
+
+@api.get("/settings/email-prefs")
+async def get_email_prefs(user=Depends(get_current_user)):
+    prefs = await _get_email_prefs(user["user_id"])
+    return {**prefs, "resend_configured": bool(os.environ.get("RESEND_API_KEY"))}
+
+@api.put("/settings/email-prefs")
+async def update_email_prefs(body: EmailPrefsBody, user=Depends(get_current_user)):
+    update = {k: v for k, v in body.dict().items() if v is not None}
+    update["updated_at"] = now_iso()
+    await db.email_prefs.update_one({"user_id": user["user_id"]}, {"$set": update}, upsert=True)
+    return {"ok": True, **update}
+
+@api.post("/notifications/test-email")
+async def send_test_email(user=Depends(get_current_user)):
+    """Send a test email to the current user so they can verify delivery."""
+    body_html = ("This is a test email from IntelligenceOS. If you're reading this, "
+                 "notification emails are working — you'll receive alerts when your thesis "
+                 "assumptions become at-risk or broken.")
+    html = _email_html("Test email · IntelligenceOS", body_html,
+                       os.environ.get("APP_URL", ""), "Open dashboard" if os.environ.get("APP_URL") else None)
+    result = await _send_email(user["email"], "Test email · IntelligenceOS", html)
+    return result
+
+@api.post("/portfolio/digest/send")
+async def send_portfolio_digest(user=Depends(get_current_user)):
+    """Compose and send a weekly portfolio digest with AI-generated summary."""
+    prefs = await _get_email_prefs(user["user_id"])
+    if not prefs.get("weekly_digest", True):
+        return {"skipped": True, "reason": "user opted out"}
+    port = await get_portfolio(user)
+    brief = await portfolio_brief(user)
+    holdings_rows = "".join([
+        f'<tr><td style="padding:6px 8px;color:#F3F4F6;font-family:monospace;">{h["ticker"]}</td>'
+        f'<td style="padding:6px 8px;color:#9CA3AF;text-align:right;">${h["value"]:.0f}</td>'
+        f'<td style="padding:6px 8px;text-align:right;color:{"#22C55E" if h["gain"] >= 0 else "#EF4444"};font-family:monospace;">{h["gain_pct"]:+.2f}%</td></tr>'
+        for h in (port.get("holdings") or [])[:10]
+    ])
+    body_html = (
+        f'<div style="font-family:monospace;color:#6B7280;font-size:12px;margin-bottom:16px;">'
+        f'Portfolio value <strong style="color:#F3F4F6;">${port.get("total_value",0):,.0f}</strong> · '
+        f'total gain <strong style="color:{"#22C55E" if port.get("total_gain",0)>=0 else "#EF4444"};">'
+        f'{port.get("total_gain_pct",0):+.2f}%</strong> · health <strong style="color:#F97316;">'
+        f'{port.get("health_score",0)}/100</strong></div>'
+        f'<p style="color:#F3F4F6;">{brief.get("brief",{}).get("summary","No brief available.")}</p>'
+        f'<table role="presentation" cellspacing="0" cellpadding="0" width="100%" '
+        f'style="margin-top:16px;border-top:1px solid #22262E;">'
+        f'<tr><td colspan="3" style="padding-top:12px;color:#6B7280;font-size:10px;text-transform:uppercase;letter-spacing:0.15em;">Top Holdings</td></tr>'
+        f'{holdings_rows}</table>'
+    )
+    html = _email_html("Your weekly portfolio digest", body_html,
+                       os.environ.get("APP_URL", ""), "Open portfolio" if os.environ.get("APP_URL") else None)
+    result = await _send_email(user["email"], "Your weekly portfolio digest · IntelligenceOS", html)
+    return result
+
+
+app.include_router(api)
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
@@ -77,13 +1834,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+
+@app.on_event("startup")
+async def startup():
+    # Always register APScheduler (in-process). Celery beat (if running) is an
+    # additional scheduler for prod scale — either firing this job is fine
+    # (max_instances=1 + coalesce prevents overlap).
+    try:
+        scheduler.add_job(thesis_auto_recheck_job, "interval", hours=6, id="thesis_auto_recheck",
+                          next_run_time=datetime.now(timezone.utc) + timedelta(minutes=5),
+                          max_instances=1, coalesce=True)
+        scheduler.start()
+        logger.info("scheduler: APScheduler started, next run in 5 minutes")
+    except Exception as e:
+        logger.error(f"scheduler failed to start: {e}")
 
 @app.on_event("shutdown")
-async def shutdown_db_client():
+async def shutdown():
+    try:
+        scheduler.shutdown(wait=False)
+    except Exception:
+        pass
     client.close()

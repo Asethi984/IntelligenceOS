@@ -1,0 +1,38 @@
+{
+  "summary": "REGRESSION PASS 120/120 (100%). All fixes from iteration_6 verified. Redis installed & RUNNING under supervisor (redis-cli ping → PONG). celery_worker + celery_beat both RUNNING with no connection retry spam. APScheduler restored as always-on: GET /api/scheduler/status now returns jobs=[{id:'thesis_auto_recheck', next_run:'2026-07-19 19:58:52.353617+00:00'}]. POST /api/scheduler/run-now returns 200 with {scanned:0, triggered:[]}. Previously-verified fixes all still green: (1) /api/auth/me 401 for unauth, (2) signup+login shapes with role=Owner/plan=Free/no _id leak, (3) news relevance filter for AAPL+NVDA/TSLA/MSFT, (4) business summary present for AAPL+MSFT+NVDA+TSLA (bad-ticker returns 200 not 500), (5) documents/contradiction retrieved>=2 with 2 uploaded contradictory docs, (6) portfolio + screener shapes intact, (7) all 12 AI agents return _meta.model=='gpt-5.4' with per-agent differentiated context (test_19 + test_20). Scheduler regression from iteration_6 is FIXED. No new pytest modules were required.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "POST /api/notifications/{id}/read", "issue": "carry-over from earlier iterations: still returns {ok:true} when id does not exist"},
+      {"endpoint": "POST /api/watchlist/remove", "issue": "carry-over: silent no-op when ticker only in default_tickers"},
+      {"endpoint": "POST /api/documents/contradiction", "issue": "carry-over: ticker-less call scans all user chunks"},
+      {"endpoint": "GET /api/company/{ticker}/news", "issue": "Relevance filter uses only the first token of company_name (split(' ')[0]) — brittle for multi-word issuers (e.g. 'JPMorgan Chase' → 'jpmorgan'). Works for AAPL/NVDA/MSFT/TSLA."}
+    ]
+  },
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_11_scheduler.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "NONE for iteration_7. All requested fixes verified end-to-end. Optional carry-overs (minor list above) remain from earlier iterations but are not regressions from this iteration."
+  ],
+  "critical_code_review_comments": [
+    "Startup handler now starts APScheduler unconditionally — safer than the iteration_6 boolean latch. Consider still ping'ing Redis at boot and logging Celery health so ops can see whether Celery beat is picking up jobs vs. APScheduler doing the work solo.",
+    "APScheduler + Celery beat both running means thesis_auto_recheck may execute twice per cycle in this configuration. Verify idempotency in celery_tasks.thesis_auto_recheck_task (currently harmless since scanned=0 in a fresh env, but could cause duplicate notifications with real theses).",
+    "server.py still >1700 lines — domain-router split remains recommended (repeat feedback from iterations 5 & 6).",
+    "News relevance filter first-token issue (server.py:377-384) remains — low priority carry-over.",
+    "RESEND_FROM=onboarding@resend.dev sandbox limitation remains — verify a real domain before prod."
+  ],
+  "updated_files": [],
+  "success_rate": {
+    "backend": "100% (120/120 pytest)",
+    "frontend": "not tested (backend-only scope per request)"
+  },
+  "test_credentials": "Dynamic per-run via /api/auth/signup — TEST_iops_<rand>@example.com / TestPass!234 (see conftest.py). scoretest@int.os / password123 available but not used.",
+  "seed_data_creation": "No new seed. Existing tests provision their own fresh users per run.",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Backend at 100% (120/120). Scheduler regression from iteration_6 is fully resolved: redis-server installed via /etc/supervisor/conf.d/redis.conf, APScheduler restored as always-on primary (Celery beat is bonus). If next work touches scheduling, be aware APScheduler + Celery beat can both fire thesis_auto_recheck — verify idempotency in celery_tasks.py. All 12 AI agent tests confirm gpt-5.4 model in _meta. No open critical backend issues.",
+  "rca_of_the_issue": "N/A — iteration_6 blocker (Redis daemon missing → APScheduler disabled via env gate → jobs=[]) is resolved. Redis is RUNNING under supervisor, backend startup handler always starts APScheduler, and /api/scheduler/status returns the thesis_auto_recheck job with a valid next_run string."
+}

@@ -1,0 +1,68 @@
+{
+  "summary": "IntelligenceOS Wave-4 bug-batch backend verification: all 8 user-reported bugs verified fixed end-to-end. Added 5 new pytest modules (test_18_ai_assist, test_19_agent_differentiation, test_20_gpt54_model, test_21_command_center_add, test_22_bug_fixes) with 36 new tests. Full backend regression: 109/109 PASSED in 160s (73 pre-existing + 36 new). Real integrations exercised: Emergent LLM (GPT-5.4) via EMERGENT_LLM_KEY across research/financial/news/competitor/risk/valuation/macro agents + note_assist + market_brief + portfolio_brief; every AI response returned _meta.model=='gpt-5.4' and _meta.temperature matched AGENT_CONFIG (research=0.4, financial=0.2, news=0.5, valuation=0.2). yfinance drove income statement (financial), peer quotes (competitor), beta/short/debt (risk), PE/PS/PB/EV-EBITDA (valuation), headlines (news/materiality), and 10y/oil/USD (macro) — confirmed as visible signals in agent evidence/summary. BM25 contradiction fix confirmed: rare-word query on a 2-doc corpus now returns retrieved>=2 (previously 0). Living Thesis v2 versioning via parent_id returns version==2 with matching chain_id. Command Center Add Ticker dialog reaches POST /api/watchlist/add across stocks/crypto/etfs. shadcn Input.jsx contains text-foreground; index.css has explicit input color override. Redis is running (redis-cli PONG) and REDIS_URL is set; Celery worker/beat intentionally not activated (operator action).",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {
+        "endpoint": "GET /api/watchlist/lists",
+        "issue": "user_slots_max hardcoded to 999 for non-Free plans (carried over from iter 4). Cosmetic; consider a plan-tier constant map."
+      },
+      {
+        "endpoint": "POST /api/notifications/{id}/read",
+        "issue": "Still returns {ok:true} when notification_id does not exist for the user (carried over from iter 4). Consider 404."
+      },
+      {
+        "endpoint": "POST /api/watchlist/remove",
+        "issue": "Silent no-op when ticker is only in default_tickers (carried over from iter 4). Consider {ok, removed:bool}."
+      },
+      {
+        "endpoint": "POST /api/documents/contradiction",
+        "issue": "Ticker-less call is allowed and will scan all user chunks — could be expensive for power users; consider a ticker OR doc_ids requirement or a chunk-count guardrail."
+      },
+      {
+        "endpoint": "POST /api/agents/assist",
+        "issue": "context_type is a free string — invalid values silently fall through to the default 'Improve the writing.' guide. Consider Pydantic Literal[...] validation returning 422 for unknown context_type."
+      }
+    ]
+  },
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_18_ai_assist.py",
+    "/app/backend/tests/test_19_agent_differentiation.py",
+    "/app/backend/tests/test_20_gpt54_model.py",
+    "/app/backend/tests/test_21_command_center_add.py",
+    "/app/backend/tests/test_22_bug_fixes.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "OPTIONAL: Constrain NoteAssistBody.context_type to a Pydantic Literal[...] so unknown values 422 instead of silently defaulting.",
+    "OPTIONAL: Guard /documents/contradiction with a ticker OR doc_ids requirement to avoid full-tenant BM25 scans.",
+    "OPTIONAL: Carry-over items from iter 4 (watchlist/remove observability, notifications/{id}/read 404, plan-tier constants)."
+  ],
+  "critical_code_review_comments": [
+    "server.py is 1709 lines mixing 18+ concerns — the note_assist agent + AGENT_CONFIG are additive but the domain-router split is now urgent (was 1605 in iter 4).",
+    "_build_agent_context spawns synchronous yf.Ticker(T).info / .financials / .news calls inside an async endpoint per request — each agent query pays a 1-3s yfinance tax before the LLM call. Wrap in run_in_executor or cache profile info with a short TTL.",
+    "AGENT_CONFIG.max_evidence is only injected into the system prompt as a soft cap — LLM may still return more/fewer items. If it's a real contract, enforce with response-side slicing (result['evidence'] = result['evidence'][:cfg['max_evidence']]).",
+    "run_agent silently returns {'summary': 'Analysis unavailable: ...'} on parse/API failures with status 200. This is fine for UX but hides real 5xx from monitoring — log to a dedicated error bucket or include a boolean 'ai_ok' in _meta.",
+    "The 'note_assist' agent still forces a JSON contract with evidence/sources/confidence/assumptions in the system prompt, but the /agents/assist endpoint only cares about `summary`. That's wasted tokens on every AI-write call — consider a slim system prompt for note_assist only.",
+    "BM25 fix (return top_k always) is correct, but for large corpora the O(N) chunk scan on every /contradiction call is unbounded — add a per-user chunk-count guardrail or index on {user_id, ticker}.",
+    "celery_tasks.py + REDIS_URL are wired in .env but no worker/beat runs in this environment — APScheduler is still the live scheduler. Confirm that the switch is manual (as documented in the request) before shipping to prod, otherwise scheduled jobs may double-fire."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_18_ai_assist.py (new)",
+    "/app/backend/tests/test_19_agent_differentiation.py (new)",
+    "/app/backend/tests/test_20_gpt54_model.py (new)",
+    "/app/backend/tests/test_21_command_center_add.py (new)",
+    "/app/backend/tests/test_22_bug_fixes.py (new)"
+  ],
+  "success_rate": {
+    "backend": "100% (109/109 pytest passing; 36 new + 73 pre-existing regression)",
+    "frontend": "not tested (backend-only scope per request)"
+  },
+  "test_credentials": "Dynamic per-run via /api/auth/signup — session user TEST_iops_<rand>@example.com / TestPass!234 (see conftest.py). scoretest@int.os / password123 from /app/memory/test_credentials.md was NOT used since tests provision fresh isolated users.",
+  "seed_data_creation": "test_21 seeds AMZN into stocks, SOL-USD into crypto, SPY into etfs, plus a TEST_IDEM idempotency ticker. test_22 seeds a TSLA living thesis (v1+v2 via parent_id), plus two contradictory .txt documents (bug4_bull.txt / bug4_bear.txt) under ticker=BUG4T. All under uniquely-scoped session user, so no interference with prior seeded data.",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Backend green at 109/109. All 8 wave-4 user-reported bugs are verifiably resolved: (1) Command Center Add Ticker → POST /api/watchlist/add works for stocks/crypto/etfs; (2) Living Thesis v2 versioning works via parent_id, chain_id preserved, version==2; (3) shadcn Input.jsx has 'text-foreground', index.css has input color override (static check only — full visual verify still needs Playwright); (4) BM25 contradiction fix — retrieved>=2 on rare-word queries; (5) /company/{T}/score + /agents/query('research', NVDA) both work end-to-end; (6) all AI responses return _meta.model=='gpt-5.4' (including /market/brief, /portfolio/brief, /agents/assist); (7) agents genuinely differ — different temperatures (research=0.4/financial=0.2/news=0.5/valuation=0.2), and different context enrichment (macro shows 10y/oil/USD keywords in output; risk shows beta/debt keywords; financial vs competitor produce non-identical summaries); (8) /agents/assist works for all 7 context_type values (note/thesis/journal_reason/journal_expected/catalyst/risk/assumption). Redis PONG confirmed; celery not started (intentional per request). Main agent can proceed with frontend Playwright verification for BUG 3 (input color visual) and BUG 5 (score-badge visibility on /company/{ticker}).",
+  "rca_of_the_issue": "All 8 reported bugs reproduced only against the pre-fix code path (per prompt); the current code paths verified by test_18-22 confirm each fix. Notable RCA re-verified in tests: (BUG 4) BM25Okapi returns raw score=0.0 across the entire corpus when the query contains only rare/OOV tokens for a small N-doc collection because IDF ~ log((N-df+0.5)/(df+0.5))+1 does not surface signal when every doc share/lacks the tokens uniformly; test_22::test_bug4_contradiction_returns_retrieved_when_bm25_scores_are_zero deliberately uses 'xyzzzq unusualtokenfoobarbaz nonexistent' as the query to trigger the exact all-zero-scores path and asserts retrieved>=2 — passes now that the '>0' filter was removed. (BUG 2) Root cause was frontend-side isVersioning state — backend has always accepted parent_id correctly (LivingThesisBody.parent_id → server.py line 1048 lookup) — test verifies the server contract still returns version==2 when parent_id is supplied."
+}

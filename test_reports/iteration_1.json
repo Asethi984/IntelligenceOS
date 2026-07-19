@@ -1,0 +1,97 @@
+{
+  "summary": "First backend-only pass on IntelligenceOS. 34/39 tests passing (87%). All AI agents (contradiction, management, materiality, earnings_diff, bias, market_brief, portfolio_brief, portfolio/connections, portfolio/macro, thesis assumption_check, journal/analyze) returned real GPT-5.2 JSON output – Emergent LLM integration is healthy. yfinance flows (market/overview, quote, history, company profile/financials/news, search, watchlist, portfolio KPIs, screener, DCF, graph, timeline) all work. Found 3 CRITICAL server-side bugs: (1) route-ordering shadow makes GET /api/thesis/living return [] always, (2) POST /api/alerts returns 500 due to ObjectId serialization, (3) POST /api/journal returns 500 due to same ObjectId bug (blocks the whole Decision Journal flow – list/postmortem/analyze).",
+  "backend_issues": {
+    "critical": [
+      {
+        "endpoint": "GET /api/thesis/living (list)",
+        "issue": "Route is shadowed by the earlier-declared GET /api/thesis/{ticker}. Any GET on /api/thesis/living (with or without ?ticker=…) is matched by the legacy get_thesis(ticker='living') handler and returns [] from the wrong collection (db.theses filtered by ticker='LIVING'). GET /api/thesis/living/{id}, /diff, /history, POST /api/thesis/living, and the /check endpoint are unaffected (different path segments/methods).",
+        "priority": "CRITICAL",
+        "repro": "1) POST /api/thesis/living with a valid payload → 200. 2) GET /api/thesis/living/<id> → returns the doc. 3) GET /api/thesis/living → returns []. 4) GET /api/thesis/anything_else → also returns [] with the same shape (confirms shadow).",
+        "fix": "In /app/backend/server.py, move the @api.get('/thesis/living') declaration (line ~826) BEFORE @api.get('/thesis/{ticker}') (line ~496); or delete the legacy /thesis/{ticker} endpoint if unused; or rename it to /thesis/legacy/{ticker}."
+      },
+      {
+        "endpoint": "POST /api/alerts",
+        "issue": "Returns 500 Internal Server Error. `db.alert_rules.insert_one(r)` mutates the dict in place by adding `_id: ObjectId(...)`. The endpoint then returns that same `r`, and FastAPI's jsonable_encoder fails with `TypeError: 'ObjectId' object is not iterable`.",
+        "priority": "CRITICAL",
+        "fix": "Return `{k: v for k, v in r.items() if k != '_id'}` — the same pattern used in create_living_thesis / add_pipeline."
+      },
+      {
+        "endpoint": "POST /api/journal",
+        "issue": "Returns 500 Internal Server Error – identical ObjectId serialization bug on `entry` dict after `db.journal_entries.insert_one(entry)`. This blocks the entire Decision Journal feature (list/analyze/postmortem all depend on entries being created).",
+        "priority": "CRITICAL",
+        "fix": "Return `{k: v for k, v in entry.items() if k != '_id'}` before returning."
+      }
+    ],
+    "minor": [
+      {
+        "endpoint": "POST /api/thesis (legacy create_thesis)",
+        "issue": "Same ObjectId-in-response bug as /api/alerts and /api/journal. Not exercised by current app pages but will 500 if called."
+      },
+      {
+        "endpoint": "POST /api/auth/oauth/session",
+        "issue": "Cookie set with samesite='none' and secure=True; only usable over HTTPS. Not tested end-to-end here (no live Google session); JWT bearer fallback in get_current_user works."
+      },
+      {
+        "endpoint": "GET /api/market/quote/{ticker}",
+        "issue": "yfinance intermittently returns price=None when rate-limited. Endpoint still 200s; cache TTL is only 60s. Consider longer TTL / stale-while-revalidate for reliability."
+      }
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/conftest.py",
+    "/app/backend/tests/test_01_auth.py",
+    "/app/backend/tests/test_02_market.py",
+    "/app/backend/tests/test_03_company.py",
+    "/app/backend/tests/test_04_watchlist_portfolio.py",
+    "/app/backend/tests/test_05_ai_agents.py",
+    "/app/backend/tests/test_06_portfolio_intelligence.py",
+    "/app/backend/tests/test_07_living_thesis.py",
+    "/app/backend/tests/test_08_journal.py",
+    "/app/backend/tests/test_09_pipeline.py",
+    "/app/backend/tests/test_10_valuation_screener_docs_alerts_graph.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "Fix route-ordering: move @api.get('/thesis/living') above @api.get('/thesis/{ticker}') in server.py (or delete legacy). This is currently why the Living Thesis LIST page will always look empty.",
+    "Strip Mongo _id before returning inserted docs in create_alert (/api/alerts) and create_journal (/api/journal). Suggested pattern: `return {k: v for k, v in doc.items() if k != '_id'}`. Apply the same fix to legacy create_thesis for consistency.",
+    "After fixes, re-run pytest -q /app/backend/tests to confirm 39/39."
+  ],
+  "critical_code_review_comments": [
+    "Route ordering: FastAPI matches paths in registration order. /thesis/{ticker} declared before /thesis/living silently swallows the list route. Prefer more-specific routes first, or use unambiguous prefixes.",
+    "Motor's insert_one mutates the input dict with _id. Three endpoints (create_thesis legacy, create_alert, create_journal) return the mutated dict → 500 on serialization. Adopt a single helper like `def _strip_id(d): return {k:v for k,v in d.items() if k != '_id'}` and use everywhere.",
+    "server.py is 1113 lines and contains auth, market, portfolio, thesis, journal, pipeline, agents, valuation, RAG, graph — consider splitting into routers per domain.",
+    "AGENT_SYSTEM string prompts are duplicated logic; strict-JSON instruction is appended in run_agent. Fine, but no schema validation on the LLM output beyond .setdefault — malformed JSON silently returns fallback with 'Analysis unavailable'.",
+    "portfolio/macro parses LLM 'factor:score' lines by regex-ish digit extraction. If model returns 'interest_rates: 65-75', it silently truncates. Consider structured tool-use / json schema.",
+    "yfinance calls are synchronous inside async endpoints — will block the event loop under load. Wrap in run_in_executor for production."
+  ],
+  "updated_files": [
+    "/app/backend/tests/__init__.py",
+    "/app/backend/tests/conftest.py",
+    "/app/backend/tests/test_01_auth.py",
+    "/app/backend/tests/test_02_market.py",
+    "/app/backend/tests/test_03_company.py",
+    "/app/backend/tests/test_04_watchlist_portfolio.py",
+    "/app/backend/tests/test_05_ai_agents.py",
+    "/app/backend/tests/test_06_portfolio_intelligence.py",
+    "/app/backend/tests/test_07_living_thesis.py",
+    "/app/backend/tests/test_08_journal.py",
+    "/app/backend/tests/test_09_pipeline.py",
+    "/app/backend/tests/test_10_valuation_screener_docs_alerts_graph.py",
+    "/app/memory/test_credentials.md"
+  ],
+  "success_rate": {
+    "backend": "87% (34/39 tests passing – 2 failed, 3 blocked-by-fixture; root cause = 3 server bugs above)",
+    "frontend": "not tested (backend-only pass)"
+  },
+  "test_credentials": "Test users are created dynamically via POST /api/auth/signup with TEST_iops_<rand>@example.com / TestPass!234. See /app/memory/test_credentials.md.",
+  "seed_data_creation": "Each pytest session creates a fresh user, 3 portfolio holdings (AAPL/MSFT/NVDA), a watchlist add (AMD), a Living Thesis v1+v2 for AAPL, and 2 journal entries. Data prefixed with TEST_ where applicable.",
+  "retest_needed": true,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "After main agent fixes the 3 issues (route order + 2 ObjectId returns), re-run `cd /app/backend && REACT_APP_BACKEND_URL=<preview> python -m pytest tests/ -v` — expect 39 passed. All AI endpoints already verified working with GPT-5.2 via Emergent LLM key. yfinance works but is rate-limit-sensitive; treat null prices as warnings not failures.",
+  "rca_of_the_issue": "1) Living-thesis LIST bug: FastAPI resolves routes in declaration order. The legacy get_thesis handler on /thesis/{ticker} (line 496) is declared BEFORE list_living_theses on /thesis/living (line 826). GET /thesis/living therefore matches /thesis/{ticker} with ticker='living', querying db.theses (not db.living_theses) filtered by ticker='LIVING' → always []. Fix: reorder declarations or namespace the routes. 2 & 3) Motor's insert_one mutates the input document adding a BSON ObjectId under `_id`. create_alert and create_journal return that mutated dict, which FastAPI's jsonable_encoder cannot serialize (ObjectId is not JSON-serializable and not iterable/dict-able) → 500. Fix: exclude `_id` from the response like create_living_thesis / add_pipeline already do."
+}

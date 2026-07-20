@@ -39,12 +39,14 @@ dist
 !.env.example
 !**/.env.example
 
-# Allow committed placeholder backend/.env — variable names + empty values only.
-# The Emergent platform reads this file during PullSource/build context prep.
-# Real secret values are injected by the deployment environment at runtime,
-# overriding these empty placeholders via python-dotenv (which never overwrites
-# existing env vars). NEVER put real secrets here.
+# Allow committed placeholder backend/.env and frontend/.env — variable names +
+# empty/non-secret values only. The Emergent platform reads these files during
+# PullSource/build context prep. Real secret values are injected by the
+# deployment environment at runtime, overriding these placeholders via
+# python-dotenv (which never overwrites existing env vars). NEVER put real
+# secrets here.
 !backend/.env
+!frontend/.env
 *token.json*
 *credentials.json*
 

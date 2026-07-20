@@ -25,13 +25,27 @@ from rank_bm25 import BM25Okapi
 import re as _re
 
 ROOT_DIR = Path(__file__).parent
+# load_dotenv silently skips missing files — the app does NOT require a
+# physical .env. All values come from the deployment environment (os.environ).
 load_dotenv(ROOT_DIR / '.env')
 
-MONGO_URL = os.environ['MONGO_URL']
-DB_NAME = os.environ['DB_NAME']
-JWT_SECRET = os.environ['JWT_SECRET']
-EMERGENT_LLM_KEY = os.environ.get('EMERGENT_LLM_KEY', '')
-LLM_MODEL = os.environ.get('LLM_MODEL', 'gpt-5.4')
+# ---- Config from deployment environment (no hard dependency on .env file) ----
+# MONGO_URL / DB_NAME: injected by the deployment platform.
+MONGO_URL = os.environ.get('MONGO_URL', '')
+DB_NAME = os.environ.get('DB_NAME', 'intelligenc_os')
+JWT_SECRET = os.environ.get('JWT_SECRET', '')
+
+# LLM credentials: prefer OPENAI_API_KEY (deployment env), fall back to
+# EMERGENT_LLM_KEY (legacy local-dev var) for backward compatibility.
+OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY') or os.environ.get('EMERGENT_LLM_KEY', '')
+
+# LLM model: prefer OPENAI_MODEL (deployment env), default to gpt-5-nano,
+# fall back to LLM_MODEL (legacy) for backward compatibility.
+OPENAI_MODEL = os.environ.get('OPENAI_MODEL') or os.environ.get('LLM_MODEL', 'gpt-5-nano')
+
+# Backward-compat aliases (so existing AGENT_CONFIG / run_agent references work)
+EMERGENT_LLM_KEY = OPENAI_API_KEY
+LLM_MODEL = OPENAI_MODEL
 
 # ---- Security config ----
 ALLOWED_ORIGINS = [o.strip() for o in os.environ.get('CORS_ORIGINS', '').split(',') if o.strip()]
@@ -817,7 +831,7 @@ async def run_agent(agent_key: str, prompt: str, context: str = "") -> Dict[str,
         "No markdown. Only JSON."
     )
     if not EMERGENT_LLM_KEY:
-        return {"summary": "AI key missing. Configure EMERGENT_LLM_KEY.",
+        return {"summary": "AI key missing. Configure OPENAI_API_KEY in the deployment environment.",
                 "evidence": [], "sources": [], "confidence": 0, "assumptions": []}
     try:
         chat = LlmChat(

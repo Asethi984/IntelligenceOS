@@ -33,6 +33,23 @@ JWT_SECRET = os.environ['JWT_SECRET']
 EMERGENT_LLM_KEY = os.environ.get('EMERGENT_LLM_KEY', '')
 LLM_MODEL = os.environ.get('LLM_MODEL', 'gpt-5.4')
 
+# ---- Security config ----
+ALLOWED_ORIGINS = [o.strip() for o in os.environ.get('CORS_ORIGINS', '').split(',') if o.strip()]
+COOKIE_SECURE = os.environ.get('COOKIE_SECURE', 'true').lower() == 'true'
+COOKIE_SAMESITE = os.environ.get('COOKIE_SAMESITE', 'none')  # 'none' | 'lax' | 'strict'
+MAX_UPLOAD_BYTES = int(os.environ.get('MAX_UPLOAD_BYTES', str(5 * 1024 * 1024)))  # 5 MB default
+
+# ---- JWT secret strength check (fail fast in prod) ----
+if len(JWT_SECRET) < 32 or JWT_SECRET.startswith("intelligence-os-jwt-secret-change-in-prod"):
+    if os.environ.get('ALLOW_WEAK_JWT') == '1':
+        logger.warning("JWT_SECRET is weak/placeholder. Set a 64+ char random secret. ALLOW_WEAK_JWT=1 overrides.")
+    else:
+        raise RuntimeError(
+            "Refusing to start: JWT_SECRET is missing or weak. "
+            "Generate with `python -c \"import secrets;print(secrets.token_urlsafe(48))\"` "
+            "and set JWT_SECRET in backend/.env. To override for local dev, set ALLOW_WEAK_JWT=1."
+        )
+
 client = AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
 
@@ -59,8 +76,57 @@ def verify_password(p: str, h: str) -> bool:
         return False
 
 def create_jwt(user_id: str) -> str:
-    payload = {"user_id": user_id, "exp": (now_utc() + timedelta(days=7)).timestamp()}
+    now = now_utc()
+    payload = {
+        "iss": "intelligence-os",
+        "sub": user_id,
+        "iat": int(now.timestamp()),
+        "exp": int((now + timedelta(days=7)).timestamp()),
+        "jti": secrets.token_urlsafe(16),
+    }
     return pyjwt.encode(payload, JWT_SECRET, algorithm="HS256")
+
+# ---- Simple in-memory rate limiter (per-IP, per-endpoint) ----
+# Note: single-process. For multi-worker/multi-pod, swap for Redis-backed limiter.
+_rate_buckets: Dict[str, Dict[str, list]] = {}
+def _rate_check(key: str, limit: int, window_sec: int) -> bool:
+    """Return True if request allowed, False if rate-limited."""
+    now = datetime.now().timestamp()
+    bucket = _rate_buckets.setdefault(key, [])
+    cutoff = now - window_sec
+    while bucket and bucket[0] < cutoff:
+        bucket.pop(0)
+    if len(bucket) >= limit:
+        return False
+    bucket.append(now)
+    return True
+
+def _client_ip(request: Request) -> str:
+    fwd = request.headers.get("x-forwarded-for", "")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+def rate_limit(limit: int, window_sec: int, key_prefix: str = ""):
+    """FastAPI dependency: per-IP rate limiter."""
+    def _dep(request: Request):
+        ip = _client_ip(request)
+        k = f"{key_prefix}:{ip}" if key_prefix else ip
+        if not _rate_check(k, limit, window_sec):
+            raise HTTPException(status_code=429, detail="Rate limit exceeded. Try again later.")
+        return ip
+    return _dep
+
+# ---- Password policy ----
+def validate_password(p: str) -> Optional[str]:
+    """Return error message if invalid, else None."""
+    if len(p) < 8:
+        return "Password must be at least 8 characters."
+    if len(p) > 128:
+        return "Password too long (max 128)."
+    if not any(c.isupper() for c in p) or not any(c.islower() for c in p) or not any(c.isdigit() for c in p):
+        return "Password must include upper, lower, and a digit."
+    return None
 
 async def get_current_user(request: Request) -> Dict[str, Any]:
     # Try session_token from cookie or header (Emergent OAuth), then JWT
@@ -86,14 +152,23 @@ async def get_current_user(request: Request) -> Dict[str, Any]:
     # Try JWT
     if bearer:
         try:
-            payload = pyjwt.decode(bearer, JWT_SECRET, algorithms=["HS256"])
-            user = await db.users.find_one({"user_id": payload["user_id"]}, {"_id": 0, "password_hash": 0})
+            payload = pyjwt.decode(bearer, JWT_SECRET, algorithms=["HS256"], options={"require": ["exp"]})
+            user_id = payload.get("sub") or payload.get("user_id")
+            user = await db.users.find_one({"user_id": user_id}, {"_id": 0, "password_hash": 0}) if user_id else None
             if user:
                 return user
         except Exception:
             pass
 
     raise HTTPException(status_code=401, detail="Not authenticated")
+
+
+def require_admin(user: Dict[str, Any]) -> None:
+    """RBAC gate. Call inside endpoints that need admin/Owner role."""
+    role = (user.get("role") or "").lower()
+    if role not in {"owner", "admin"}:
+        raise HTTPException(status_code=403, detail="Admin privileges required.")
+
 
 
 # ---------------- Models ----------------
@@ -152,10 +227,22 @@ class DCFBody(BaseModel):
     years: int = 5
     shares_outstanding: float
 
+class DocAskBody(BaseModel):
+    question: str = ""
+
+class DocContradictionBody(BaseModel):
+    ticker: Optional[str] = None
+    query: Optional[str] = None
+
 
 # ---------------- Auth ----------------
 @api.post("/auth/signup")
-async def signup(body: SignupBody, response: Response):
+async def signup(body: SignupBody, request: Request, response: Response):
+    pw_err = validate_password(body.password)
+    if pw_err:
+        raise HTTPException(status_code=400, detail=pw_err)
+    if not _rate_check(f"signup:{_client_ip(request)}", 5, 600):
+        raise HTTPException(status_code=429, detail="Too many signups from this IP. Try later.")
     existing = await db.users.find_one({"email": body.email}, {"_id": 0})
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
@@ -188,7 +275,9 @@ async def signup(body: SignupBody, response: Response):
     return {"token": token, "user": {"user_id": user_id, "email": body.email, "name": body.name, "role": "Owner", "plan": "Free"}}
 
 @api.post("/auth/login")
-async def login(body: LoginBody):
+async def login(body: LoginBody, request: Request):
+    if not _rate_check(f"login:{_client_ip(request)}", 10, 600):
+        raise HTTPException(status_code=429, detail="Too many login attempts. Try later.")
     user = await db.users.find_one({"email": body.email}, {"_id": 0})
     if not user or not user.get("password_hash") or not verify_password(body.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid credentials")
@@ -225,7 +314,8 @@ async def oauth_session(request: Request, response: Response):
         "user_id": user_id, "session_token": session_token,
         "expires_at": expires_at.isoformat(), "created_at": now_iso()
     })
-    response.set_cookie("session_token", session_token, httponly=True, secure=True, samesite="none", path="/", max_age=7*24*3600)
+    response.set_cookie("session_token", session_token, httponly=True, secure=COOKIE_SECURE,
+                        samesite=COOKIE_SAMESITE, path="/", max_age=7*24*3600)
     user_out = await db.users.find_one({"user_id": user_id}, {"_id": 0, "password_hash": 0})
     return {"user": user_out, "session_token": session_token}
 
@@ -932,9 +1022,20 @@ async def _bm25_retrieve(user_id: str, query: str, ticker: Optional[str] = None,
 
 @api.post("/documents/upload")
 async def upload_doc(file: UploadFile = File(...), ticker: Optional[str] = None, user=Depends(get_current_user)):
-    content = await file.read()
+    # Stream-read with size cap to prevent memory DoS.
+    contents = bytearray()
+    total = 0
+    while True:
+        chunk = await file.read(1024 * 1024)  # 1 MB chunks
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail=f"File too large. Max {MAX_UPLOAD_BYTES} bytes.")
+        contents.extend(chunk)
+    content = bytes(contents)
     text = ""
-    if file.filename.lower().endswith(".pdf"):
+    if file.filename and file.filename.lower().endswith(".pdf"):
         try:
             from pypdf import PdfReader
             import io
@@ -951,7 +1052,7 @@ async def upload_doc(file: UploadFile = File(...), ticker: Optional[str] = None,
     doc = {"doc_id": doc_id, "user_id": user["user_id"],
            "filename": file.filename, "text": text[:200000],
            "ticker": (ticker or "").upper() or None,
-           "size": len(content), "created_at": now_iso(),
+           "size": total, "created_at": now_iso(),
            "chunk_count": 0}
     # chunk & store
     chunks = _chunk_text(text[:200000])
@@ -978,11 +1079,11 @@ async def delete_document(doc_id: str, user=Depends(get_current_user)):
     return {"ok": True}
 
 @api.post("/documents/{doc_id}/ask")
-async def ask_doc(doc_id: str, body: Dict[str, Any], user=Depends(get_current_user)):
+async def ask_doc(doc_id: str, body: DocAskBody, user=Depends(get_current_user)):
     doc = await db.documents.find_one({"doc_id": doc_id, "user_id": user["user_id"]}, {"_id": 0})
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
-    question = body.get("question", "")
+    question = body.question
     # BM25 retrieve within THIS doc for scoped question
     chunks = await db.document_chunks.find({"doc_id": doc_id, "user_id": user["user_id"]}, {"_id": 0}).to_list(1000)
     if chunks and question:
@@ -997,10 +1098,10 @@ async def ask_doc(doc_id: str, body: Dict[str, Any], user=Depends(get_current_us
     return await run_agent("research", question, ctx)
 
 @api.post("/documents/contradiction")
-async def find_contradictions(body: Dict[str, Any], user=Depends(get_current_user)):
+async def find_contradictions(body: DocContradictionBody, user=Depends(get_current_user)):
     """Cross-document contradiction detection via BM25 chunk retrieval + LLM."""
-    ticker = body.get("ticker")
-    query = body.get("query") or "contradictions inconsistencies between guidance, financials, risk factors, and management statements"
+    ticker = body.ticker
+    query = body.query or "contradictions inconsistencies between guidance, financials, risk factors, and management statements"
     hits = await _bm25_retrieve(user["user_id"], query, ticker=ticker, top_k=10)
     if not hits:
         return {"summary": "No document chunks found. Upload filings, transcripts, or presentations first.",
@@ -1025,7 +1126,19 @@ async def find_contradictions(body: Dict[str, Any], user=Depends(get_current_use
 # ---------------- Team ----------------
 @api.get("/team/members")
 async def list_team(user=Depends(get_current_user)):
-    members = await db.users.find({}, {"_id": 0, "password_hash": 0}).limit(20).to_list(20)
+    require_admin(user)
+    # Only expose minimal PII; never leak emails of unrelated users to peers.
+    # If a team_id model is in use, scope to the caller's team; else return only self.
+    team_id = user.get("team_id")
+    if team_id:
+        members = await db.users.find({"team_id": team_id},
+                                      {"_id": 0, "password_hash": 0, "email": 0}).limit(50).to_list(50)
+    else:
+        members = [{
+            "user_id": user["user_id"], "name": user.get("name"),
+            "role": user.get("role"), "plan": user.get("plan"),
+            "picture": user.get("picture"),
+        }]
     return members
 
 
@@ -1826,12 +1939,21 @@ async def send_portfolio_digest(user=Depends(get_current_user)):
 
 
 app.include_router(api)
+
+# CORS: never allow '*' with credentials. Require explicit origins in prod.
+if not ALLOWED_ORIGINS:
+    logger.warning("CORS_ORIGINS not set — cross-origin requests will be rejected. "
+                   "Set CORS_ORIGINS=https://your-frontend.example.com in backend/.env.")
+    allowed = []
+else:
+    allowed = ALLOWED_ORIGINS
+
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=allowed,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+    allow_headers=["Authorization", "Content-Type", "X-Requested-With"],
 )
 
 

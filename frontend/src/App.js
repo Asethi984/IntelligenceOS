@@ -1,11 +1,10 @@
-import { BrowserRouter, Routes, Route, Navigate, useLocation } from "react-router-dom";
+import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import "@/App.css";
 import { Toaster } from "@/components/ui/sonner";
 import { AuthProvider } from "@/contexts/AuthContext";
 import ProtectedRoute from "@/components/ProtectedRoute";
 import Layout from "@/components/Layout";
 import Login from "@/pages/Login";
-import AuthCallback from "@/pages/AuthCallback";
 import CommandCenter from "@/pages/CommandCenter";
 import Markets from "@/pages/Markets";
 import CompanyDetail from "@/pages/CompanyDetail";
@@ -25,18 +24,15 @@ import Timeline from "@/pages/Timeline";
 import Board from "@/pages/Board";
 import Ratings from "@/pages/Ratings";
 import Landing from "@/pages/Landing";
+import Observability from "@/pages/Observability";
+import AgentPrompts from "@/pages/AgentPrompts";
 
 function AppRouter() {
-  const location = useLocation();
-  if (location.hash?.includes("session_id=")) {
-    return <AuthCallback />;
-  }
   return (
     <Routes>
       <Route path="/welcome" element={<Landing />} />
       <Route path="/login" element={<Login mode="login" />} />
       <Route path="/signup" element={<Login mode="signup" />} />
-      <Route path="/auth/callback" element={<AuthCallback />} />
       <Route element={<ProtectedRoute><Layout /></ProtectedRoute>}>
         <Route path="/" element={<CommandCenter />} />
         <Route path="/markets" element={<Markets />} />
@@ -56,6 +52,8 @@ function AppRouter() {
         <Route path="/ratings" element={<Ratings />} />
         <Route path="/team" element={<Team />} />
         <Route path="/settings" element={<Settings />} />
+        <Route path="/observability" element={<Observability />} />
+        <Route path="/agent-prompts" element={<AgentPrompts />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>

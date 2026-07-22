@@ -1,4 +1,4 @@
-"""IntelligenceOS Backend - FastAPI application."""
+"""IntelligenceOS Backend - FastAPI application (self-hosted)."""
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response, UploadFile, File, Query, Cookie
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
@@ -10,6 +10,7 @@ import uuid
 import logging
 import asyncio
 import hashlib
+import hmac
 import secrets
 from pathlib import Path
 from pydantic import BaseModel, Field, EmailStr
@@ -19,7 +20,7 @@ import jwt as pyjwt
 import bcrypt
 import httpx
 import yfinance as yf
-from emergentintegrations.llm.chat import LlmChat, UserMessage
+from openai import AsyncOpenAI, APIStatusError
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from rank_bm25 import BM25Okapi
 import re as _re
@@ -30,22 +31,40 @@ ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
 # ---- Config from deployment environment (no hard dependency on .env file) ----
-# MONGO_URL / DB_NAME: injected by the deployment platform.
-MONGO_URL = os.environ.get('MONGO_URL', '')
+MONGO_URL = os.environ.get('MONGO_URL', 'mongodb://localhost:27017')
 DB_NAME = os.environ.get('DB_NAME', 'intelligenc_os')
 JWT_SECRET = os.environ.get('JWT_SECRET', '')
 
-# LLM credentials: prefer OPENAI_API_KEY (deployment env), fall back to
-# EMERGENT_LLM_KEY (legacy local-dev var) for backward compatibility.
-OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY') or os.environ.get('EMERGENT_LLM_KEY', '')
+# ---- LLM gateway (OpenAI-compatible local gateway) ----
+# Point at your self-hosted llm-gateway (see LLM_Gateway.md). The gateway speaks
+# the OpenAI /v1/chat/completions shape and authenticates via X-API-Key header.
+OPENAI_API_BASE = os.environ.get('OPENAI_API_BASE', 'http://localhost:8080/v1')
+OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '')
+# Two-tier model mapping: cheap/fast vs strong/reasoning.
+LLM_MODEL_CHEAP = os.environ.get('LLM_MODEL_CHEAP', 'qwen3.5:4b')
+LLM_MODEL_STRONG = os.environ.get('LLM_MODEL_STRONG', 'qwen3:14b')
+# Sync wait budget (seconds) for chat completions before the gateway returns 504.
+LLM_SYNC_WAIT = int(os.environ.get('LLM_SYNC_WAIT', '600'))
+# Callback URL the gateway POSTs to when async/504 jobs finish.
+# Must be reachable FROM the gateway machine (e.g. http://fps-dev:3000/api/ai/job-callback).
+LLM_GATEWAY_CALLBACK_URL = os.environ.get('LLM_GATEWAY_CALLBACK_URL', '')
+# Callback HMAC secret (GW_CALLBACK_SECRET on the gateway side). The gateway
+# signs the callback body with this; we verify on receipt. Separate from the
+# API key (X-API-Key) — do not reuse the same value.
+LLM_GATEWAY_CALLBACK_SECRET = os.environ.get('LLM_GATEWAY_CALLBACK_SECRET', '')
 
-# LLM model: prefer OPENAI_MODEL (deployment env), default to gpt-5-nano,
-# fall back to LLM_MODEL (legacy) for backward compatibility.
-OPENAI_MODEL = os.environ.get('OPENAI_MODEL') or os.environ.get('LLM_MODEL', 'gpt-5-nano')
-
-# Backward-compat aliases (so existing AGENT_CONFIG / run_agent references work)
+# Backward-compat aliases (legacy code referenced these names)
 EMERGENT_LLM_KEY = OPENAI_API_KEY
-LLM_MODEL = OPENAI_MODEL
+LLM_MODEL = LLM_MODEL_CHEAP
+
+# ---- Email backend (pluggable: resend | smtp | none) ----
+EMAIL_BACKEND = os.environ.get('EMAIL_BACKEND', 'none').lower()
+SMTP_HOST = os.environ.get('SMTP_HOST', 'smtp.gmail.com')
+SMTP_PORT = int(os.environ.get('SMTP_PORT', '587'))
+SMTP_USER = os.environ.get('SMTP_USER', '')
+SMTP_PASS = os.environ.get('SMTP_PASS', '')
+SMTP_TLS = os.environ.get('SMTP_TLS', 'true').lower() == 'true'
+SMTP_FROM = os.environ.get('SMTP_FROM', SMTP_USER or 'IntelligenceOS <noreply@localhost>')
 
 # ---- Security config ----
 ALLOWED_ORIGINS = [o.strip() for o in os.environ.get('CORS_ORIGINS', '').split(',') if o.strip()]
@@ -143,27 +162,9 @@ def validate_password(p: str) -> Optional[str]:
     return None
 
 async def get_current_user(request: Request) -> Dict[str, Any]:
-    # Try session_token from cookie or header (Emergent OAuth), then JWT
-    session_token = request.cookies.get("session_token")
+    """JWT-only auth. Reads Bearer token; legacy session_cookie path removed (no Emergent OAuth)."""
     auth_header = request.headers.get("Authorization", "")
     bearer = auth_header.replace("Bearer ", "") if auth_header.startswith("Bearer ") else None
-
-    # Try session_token (Emergent OAuth)
-    token = session_token or bearer
-    if token:
-        session = await db.user_sessions.find_one({"session_token": token}, {"_id": 0})
-        if session:
-            expires_at = session.get("expires_at")
-            if isinstance(expires_at, str):
-                expires_at = datetime.fromisoformat(expires_at)
-            if expires_at and expires_at.tzinfo is None:
-                expires_at = expires_at.replace(tzinfo=timezone.utc)
-            if expires_at and expires_at > now_utc():
-                user = await db.users.find_one({"user_id": session["user_id"]}, {"_id": 0, "password_hash": 0})
-                if user:
-                    return user
-
-    # Try JWT
     if bearer:
         try:
             payload = pyjwt.decode(bearer, JWT_SECRET, algorithms=["HS256"], options={"require": ["exp"]})
@@ -173,7 +174,6 @@ async def get_current_user(request: Request) -> Dict[str, Any]:
                 return user
         except Exception:
             pass
-
     raise HTTPException(status_code=401, detail="Not authenticated")
 
 
@@ -298,51 +298,13 @@ async def login(body: LoginBody, request: Request):
     token = create_jwt(user["user_id"])
     return {"token": token, "user": {k: v for k, v in user.items() if k != "password_hash"}}
 
-@api.post("/auth/oauth/session")
-async def oauth_session(request: Request, response: Response):
-    body = await request.json()
-    session_id = body.get("session_id")
-    if not session_id:
-        raise HTTPException(status_code=400, detail="Missing session_id")
-    async with httpx.AsyncClient() as c:
-        r = await c.get("https://demobackend.emergentagent.com/auth/v1/env/oauth/session-data",
-                        headers={"X-Session-ID": session_id})
-        if r.status_code != 200:
-            raise HTTPException(status_code=401, detail="Invalid session_id")
-        data = r.json()
-    email = data["email"]
-    existing = await db.users.find_one({"email": email}, {"_id": 0})
-    if existing:
-        user_id = existing["user_id"]
-        await db.users.update_one({"user_id": user_id}, {"$set": {"name": data.get("name"), "picture": data.get("picture")}})
-    else:
-        user_id = f"user_{uuid.uuid4().hex[:12]}"
-        await db.users.insert_one({
-            "user_id": user_id, "email": email, "name": data.get("name"),
-            "picture": data.get("picture"), "role": "Owner", "team_id": None,
-            "plan": "Free", "created_at": now_iso(),
-        })
-    session_token = data["session_token"]
-    expires_at = now_utc() + timedelta(days=7)
-    await db.user_sessions.insert_one({
-        "user_id": user_id, "session_token": session_token,
-        "expires_at": expires_at.isoformat(), "created_at": now_iso()
-    })
-    response.set_cookie("session_token", session_token, httponly=True, secure=COOKIE_SECURE,
-                        samesite=COOKIE_SAMESITE, path="/", max_age=7*24*3600)
-    user_out = await db.users.find_one({"user_id": user_id}, {"_id": 0, "password_hash": 0})
-    return {"user": user_out, "session_token": session_token}
-
 @api.get("/auth/me")
 async def me(user=Depends(get_current_user)):
     return user
 
 @api.post("/auth/logout")
-async def logout(request: Request, response: Response):
-    token = request.cookies.get("session_token")
-    if token:
-        await db.user_sessions.delete_one({"session_token": token})
-    response.delete_cookie("session_token", path="/")
+async def logout():
+    # JWT is stateless — client discards the token. No server-side session to revoke.
     return {"ok": True}
 
 
@@ -726,7 +688,10 @@ async def delete_alert(rule_id: str, user=Depends(get_current_user)):
 
 
 # ---------------- AI Agents ----------------
-AGENT_SYSTEM = {
+# Default system prompts (seed). These are seeded into the agent_prompts collection
+# on first boot; after that, the DB copy is the source of truth — edits in the UI
+# persist without redeploying containers.
+AGENT_SYSTEM_DEFAULTS = {
     "research": "You are a senior equity research analyst. Provide a concise, structured analysis with clear reasoning.",
     "financial": "You are a CFA financial analyst. Focus on financials, ratios, and quality of earnings.",
     "news": "You are a news impact analyst. Focus on materiality, sentiment, and affected entities.",
@@ -747,26 +712,59 @@ AGENT_SYSTEM = {
     "note_assist": "You are an investment writing assistant. Rewrite or generate concise, analytical text for research notes, theses, journal entries, catalysts, risks, or assumptions. Match the requested tone. Return the rewritten text in 'summary'.",
 }
 
-# Per-agent runtime configuration (each agent is genuinely different, not just prompt)
+# In-memory cache of prompts loaded from DB (refreshed on update)
+_AGENT_SYSTEM_CACHE: Dict[str, str] = dict(AGENT_SYSTEM_DEFAULTS)
+
+async def _load_agent_prompts_from_db():
+    """Load all agent system prompts from DB, falling back to defaults."""
+    global _AGENT_SYSTEM_CACHE
+    try:
+        docs = await db.agent_prompts.find({}, {"_id": 0}).to_list(100)
+        if docs:
+            _AGENT_SYSTEM_CACHE = {d["key"]: d["system_prompt"] for d in docs}
+    except Exception as e:
+        logger.warning(f"Failed to load agent prompts from DB, using defaults: {e}")
+
+async def _get_agent_system_prompt(agent_key: str) -> str:
+    """Get the system prompt for an agent from the DB cache, or the default."""
+    if not _AGENT_SYSTEM_CACHE:
+        await _load_agent_prompts_from_db()
+    return _AGENT_SYSTEM_CACHE.get(agent_key, AGENT_SYSTEM_DEFAULTS.get(agent_key, AGENT_SYSTEM_DEFAULTS["research"]))
+
+
+# ---- Observability logging ----
+async def _log_observation(log_type: str, **kwargs):
+    """Log an observability event to the obs_logs collection."""
+    try:
+        doc = {"type": log_type, "ts": now_iso(), **kwargs}
+        await db.obs_logs.insert_one(doc)
+    except Exception as e:
+        logger.debug(f"obs log insert failed: {e}")
+
+# Per-agent runtime configuration (two-tier model: cheap=qwen3.5:4b, strong=qwen3:14b).
+# Reasoning-heavy agents route to the strong model; the rest stay on the cheap
+# fast model. Both are overridable via LLM_MODEL_CHEAP / LLM_MODEL_STRONG env.
+_AGENT_CHEAP = LLM_MODEL_CHEAP
+_AGENT_STRONG = LLM_MODEL_STRONG
 AGENT_CONFIG = {
-    "research":         {"model": LLM_MODEL,  "temperature": 0.4, "max_evidence": 6},
-    "financial":        {"model": LLM_MODEL,  "temperature": 0.2, "max_evidence": 8},
-    "news":             {"model": LLM_MODEL,  "temperature": 0.5, "max_evidence": 5},
-    "competitor":       {"model": LLM_MODEL,  "temperature": 0.4, "max_evidence": 6},
-    "risk":             {"model": LLM_MODEL,  "temperature": 0.3, "max_evidence": 8},
-    "valuation":        {"model": LLM_MODEL,  "temperature": 0.2, "max_evidence": 6},
-    "macro":            {"model": LLM_MODEL,  "temperature": 0.5, "max_evidence": 5},
-    "market_brief":     {"model": LLM_MODEL,  "temperature": 0.6, "max_evidence": 5},
-    "portfolio_brief":  {"model": LLM_MODEL,  "temperature": 0.4, "max_evidence": 5},
-    "contradiction":    {"model": LLM_MODEL,  "temperature": 0.2, "max_evidence": 10},
-    "management":       {"model": LLM_MODEL,  "temperature": 0.3, "max_evidence": 6},
-    "materiality":      {"model": LLM_MODEL,  "temperature": 0.3, "max_evidence": 4},
-    "earnings_diff":    {"model": LLM_MODEL,  "temperature": 0.2, "max_evidence": 8},
-    "bias":             {"model": LLM_MODEL,  "temperature": 0.6, "max_evidence": 6},
-    "assumption_check": {"model": LLM_MODEL,  "temperature": 0.2, "max_evidence": 4},
-    "hidden_connections":{"model": LLM_MODEL, "temperature": 0.5, "max_evidence": 6},
-    "macro_exposure":   {"model": LLM_MODEL,  "temperature": 0.3, "max_evidence": 9},
-    "note_assist":      {"model": LLM_MODEL,  "temperature": 0.6, "max_evidence": 0},
+    "research":         {"model": _AGENT_CHEAP, "temperature": 0.4, "max_evidence": 6},
+    "financial":        {"model": _AGENT_STRONG, "temperature": 0.2, "max_evidence": 8},
+    "news":             {"model": _AGENT_CHEAP, "temperature": 0.5, "max_evidence": 5},
+    "competitor":       {"model": _AGENT_STRONG, "temperature": 0.4, "max_evidence": 6},
+    "risk":             {"model": _AGENT_STRONG, "temperature": 0.3, "max_evidence": 8},
+    "valuation":        {"model": _AGENT_STRONG, "temperature": 0.2, "max_evidence": 6},
+    "macro":            {"model": _AGENT_CHEAP, "temperature": 0.5, "max_evidence": 5},
+    "market_brief":     {"model": _AGENT_CHEAP, "temperature": 0.6, "max_evidence": 5},
+    "portfolio_brief":  {"model": _AGENT_CHEAP, "temperature": 0.4, "max_evidence": 5},
+    "contradiction":    {"model": _AGENT_STRONG, "temperature": 0.2, "max_evidence": 10},
+    "management":       {"model": _AGENT_STRONG, "temperature": 0.3, "max_evidence": 6},
+    "materiality":      {"model": _AGENT_CHEAP, "temperature": 0.3, "max_evidence": 4},
+    "earnings_diff":    {"model": _AGENT_STRONG, "temperature": 0.2, "max_evidence": 8},
+    "bias":             {"model": _AGENT_CHEAP, "temperature": 0.6, "max_evidence": 6},
+    "assumption_check": {"model": _AGENT_STRONG, "temperature": 0.2, "max_evidence": 4},
+    "hidden_connections":{"model": _AGENT_CHEAP, "temperature": 0.5, "max_evidence": 6},
+    "macro_exposure":   {"model": _AGENT_CHEAP, "temperature": 0.3, "max_evidence": 9},
+    "note_assist":      {"model": _AGENT_CHEAP, "temperature": 0.6, "max_evidence": 0},
 }
 
 async def _build_agent_context(agent_key: str, ticker: Optional[str], base_ctx: str) -> str:
@@ -775,6 +773,8 @@ async def _build_agent_context(agent_key: str, ticker: Optional[str], base_ctx: 
         return base_ctx
     T = ticker.upper()
     parts = [base_ctx] if base_ctx else []
+    import time as _time
+    t0 = _time.monotonic()
     try:
         if agent_key == "financial" or agent_key == "earnings_diff":
             tk = yf.Ticker(T)
@@ -816,11 +816,64 @@ async def _build_agent_context(agent_key: str, ticker: Optional[str], base_ctx: 
                     parts.append(f"  {label}: {q['price']:.2f} ({q.get('change_pct',0):+.2f}%)")
     except Exception as e:
         logger.debug(f"context enrichment failed for {agent_key}/{T}: {e}")
+    latency_ms = int((_time.monotonic() - t0) * 1000)
+    await _log_observation("data_source", source="yfinance", operation="context_enrichment",
+        agent=agent_key, ticker=T, status="success" if len(parts) > 1 else "empty",
+        latency_ms=latency_ms, fields_returned=len(parts) - (1 if base_ctx else 0))
     return "\n".join(parts)
 
+# ---- LLM gateway client (OpenAI-compatible, X-API-Key auth) ----
+# Lazily built so import never fails when key is absent (e.g. config-only boot).
+_llm_client: Optional[AsyncOpenAI] = None
+
+def _get_llm_client() -> AsyncOpenAI:
+    global _llm_client
+    if _llm_client is None:
+        _llm_client = AsyncOpenAI(
+            base_url=OPENAI_API_BASE,
+            api_key=OPENAI_API_KEY or "unused",
+            default_headers={"X-API-Key": OPENAI_API_KEY} if OPENAI_API_KEY else {},
+            timeout=float(LLM_SYNC_WAIT + 30),
+        )
+    return _llm_client
+
+async def _poll_gateway_job(job_id: str) -> Dict[str, Any]:
+    """Poll GET /v1/jobs/{id} after a sync 504 until terminal, then return the OpenAI-shaped result.
+    Checks the DB first — the gateway callback may have already delivered the result."""
+    # Fast path: callback endpoint may have stored the result already.
+    cached = await db.llm_job_results.find_one({"job_id": job_id}, {"_id": 0})
+    if cached and cached.get("result"):
+        return cached["result"]
+    base = OPENAI_API_BASE.rstrip("/").replace("/v1", "")  # gateway root
+    if not base.endswith("/v1"):
+        jobs_url = f"{base.rstrip('/')}/v1/jobs/{job_id}"
+    else:
+        jobs_url = f"{base}/jobs/{job_id}"
+    headers = {"X-API-Key": OPENAI_API_KEY} if OPENAI_API_KEY else {}
+    deadline = asyncio.get_event_loop().time() + LLM_SYNC_WAIT
+    while asyncio.get_event_loop().time() < deadline:
+        # Check DB first (callback may have arrived between polls).
+        cached = await db.llm_job_results.find_one({"job_id": job_id}, {"_id": 0})
+        if cached and cached.get("result"):
+            return cached["result"]
+        async with httpx.AsyncClient(timeout=30) as c:
+            r = await c.get(jobs_url, headers=headers)
+        if r.status_code == 404:
+            raise RuntimeError(f"gateway job {job_id} not found")
+        if r.status_code == 200:
+            job = r.json()
+            status = job.get("status")
+            if status in ("done", "failed", "canceled"):
+                if status != "done":
+                    raise RuntimeError(job.get("error") or f"job {status}")
+                return job.get("result") or {}
+        await asyncio.sleep(2)
+    raise RuntimeError(f"gateway job {job_id} timed out after {LLM_SYNC_WAIT}s")
+
 async def run_agent(agent_key: str, prompt: str, context: str = "") -> Dict[str, Any]:
-    system = AGENT_SYSTEM.get(agent_key, AGENT_SYSTEM["research"])
+    system = await _get_agent_system_prompt(agent_key)
     cfg = AGENT_CONFIG.get(agent_key, AGENT_CONFIG["research"])
+    model = cfg["model"]  # already mapped to CHEAP/STRONG in AGENT_CONFIG
     system += (
         "\n\nYou MUST respond in strict JSON with these keys: "
         f"summary (string, 2-4 sentences), "
@@ -830,17 +883,49 @@ async def run_agent(agent_key: str, prompt: str, context: str = "") -> Dict[str,
         "assumptions (array of strings). "
         "No markdown. Only JSON."
     )
-    if not EMERGENT_LLM_KEY:
-        return {"summary": "AI key missing. Configure OPENAI_API_KEY in the deployment environment.",
+    full_prompt = (context + "\n\n" + prompt) if context else prompt
+    if not OPENAI_API_KEY:
+        await _log_observation("llm_call", agent=agent_key, model=model, status="error",
+            error="OPENAI_API_KEY not configured", prompt_length=len(full_prompt))
+        return {"summary": "AI key missing. Configure OPENAI_API_KEY (X-API-Key for the gateway).",
                 "evidence": [], "sources": [], "confidence": 0, "assumptions": []}
+    # If a callback URL is configured, tell the gateway to POST the result there
+    # when it finishes — useful when the sync call times out (504). The 504 poll
+    # path checks the DB first so the callback short-circuits the polling loop.
+    extra_headers = {}
+    if LLM_GATEWAY_CALLBACK_URL:
+        extra_headers["X-Callback-Url"] = LLM_GATEWAY_CALLBACK_URL
+    import time as _time
+    t0 = _time.monotonic()
     try:
-        chat = LlmChat(
-            api_key=EMERGENT_LLM_KEY,
-            session_id=f"{agent_key}-{uuid.uuid4().hex[:8]}",
-            system_message=system,
-        ).with_model("openai", cfg["model"])
-        reply = await chat.send_message(UserMessage(text=context + "\n\n" + prompt if context else prompt))
-        text = reply.strip() if isinstance(reply, str) else str(reply)
+        client = _get_llm_client()
+        try:
+            resp = await client.chat.completions.create(
+                model=model,
+                messages=[{"role": "system", "content": system},
+                          {"role": "user", "content": full_prompt}],
+                temperature=cfg["temperature"],
+                # JSON mode constrains decoding so reasoning models (qwen3.x)
+                # don't burn the token budget "thinking" and return empty.
+                response_format={"type": "json_object"},
+                extra_query={"wait": LLM_SYNC_WAIT},
+                extra_headers=extra_headers if extra_headers else None,
+            )
+            text = (resp.choices[0].message.content or "").strip()
+        except APIStatusError as e:
+            # 504 = still running, not an error. Recover via job poll (or callback).
+            if e.status_code == 504:
+                job_id = (e.response.headers.get("X-Job-Id") if e.response else None)
+                if not job_id:
+                    raise RuntimeError("gateway returned 504 with no X-Job-Id")
+                result = await _poll_gateway_job(job_id)
+                try:
+                    text = (result["choices"][0]["message"]["content"] or "").strip()
+                except (KeyError, IndexError, TypeError):
+                    raise RuntimeError("gateway job result had no content")
+            else:
+                raise
+        # Gateway JSON mode should already give clean JSON; still defend against stray prose.
         start = text.find("{"); end = text.rfind("}")
         if start >= 0 and end > start:
             text = text[start:end+1]
@@ -850,11 +935,26 @@ async def run_agent(agent_key: str, prompt: str, context: str = "") -> Dict[str,
         parsed.setdefault("sources", [])
         parsed.setdefault("confidence", 60)
         parsed.setdefault("assumptions", [])
-        parsed["_meta"] = {"agent": agent_key, "model": cfg["model"], "temperature": cfg["temperature"]}
+        parsed["_meta"] = {"agent": agent_key, "model": model, "temperature": cfg["temperature"]}
+        latency_ms = int((_time.monotonic() - t0) * 1000)
+        await _log_observation("llm_call", agent=agent_key, model=model, status="success",
+            latency_ms=latency_ms, prompt_length=len(full_prompt),
+            response_length=len(text), temperature=cfg["temperature"],
+            response_preview=text[:500])
         return parsed
     except Exception as e:
-        logger.error(f"agent {agent_key} failed: {e}")
-        return {"summary": f"Analysis unavailable: {str(e)[:100]}",
+        latency_ms = int((_time.monotonic() - t0) * 1000)
+        error_str = str(e)
+        error_type = type(e).__name__
+        # Capture full traceback for debugging
+        import traceback
+        tb = traceback.format_exc()
+        await _log_observation("llm_call", agent=agent_key, model=model, status="error",
+            latency_ms=latency_ms, prompt_length=len(full_prompt),
+            error=error_str, error_type=error_type,
+            traceback=tb[:4000], temperature=cfg["temperature"])
+        logger.error(f"agent {agent_key} failed: {e}\n{tb[:1000]}")
+        return {"summary": f"Analysis unavailable: {error_str[:100]}",
                 "evidence": [], "sources": [], "confidence": 0, "assumptions": []}
 
 @api.post("/agents/query")
@@ -873,6 +973,43 @@ async def agents_query(body: AgentQueryBody, user=Depends(get_current_user)):
         "result": result, "created_at": now_iso()
     })
     return result
+
+
+# ---------------- LLM Gateway Callback ----------------
+@api.post("/ai/job-callback")
+async def llm_job_callback(request: Request):
+    """Receives async job results from the LLM gateway (X-Callback-Url flow).
+    The gateway POSTs a Job object here when a 504'd sync job finishes.
+    We store it in llm_job_results so the 504 poll path short-circuits.
+    If LLM_GATEWAY_CALLBACK_SECRET is set, we verify the HMAC signature."""
+    # Verify signature if a callback secret is configured
+    if LLM_GATEWAY_CALLBACK_SECRET:
+        sig = request.headers.get("X-Gateway-Signature", "")
+        raw_body = await request.body()
+        expected = "sha256=" + hmac.new(
+            LLM_GATEWAY_CALLBACK_SECRET.encode(), raw_body, hashlib.sha256
+        ).hexdigest()
+        if not hmac.compare_digest(expected, sig):
+            raise HTTPException(status_code=401, detail="Invalid callback signature")
+        body = json.loads(raw_body)
+    else:
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid JSON")
+    job_id = body.get("id")
+    if not job_id:
+        raise HTTPException(status_code=400, detail="Missing job id")
+    status = body.get("status")
+    result = body.get("result")
+    await db.llm_job_results.update_one(
+        {"job_id": job_id},
+        {"$set": {"job_id": job_id, "status": status, "result": result,
+                  "error": body.get("error"), "received_at": now_iso()}},
+        upsert=True,
+    )
+    logger.info(f"llm callback: job {job_id} status={status}")
+    return {"ok": True}
 
 
 class NoteAssistBody(BaseModel):
@@ -1822,22 +1959,50 @@ def _email_html(title: str, body: str, cta_url: Optional[str] = None, cta_text: 
 </table></body></html>"""
 
 async def _send_email(to_email: str, subject: str, html: str) -> Dict[str, Any]:
-    """Non-blocking Resend send. Returns {sent:bool, id?, error?}."""
-    resend_key = os.environ.get("RESEND_API_KEY")
-    if not resend_key:
-        return {"sent": False, "error": "RESEND_API_KEY not configured"}
-    try:
-        import resend
-        resend.api_key = resend_key
-        params = {
-            "from": os.environ.get("RESEND_FROM", "IntelligenceOS <onboarding@resend.dev>"),
-            "to": [to_email], "subject": subject, "html": html,
-        }
-        result = await asyncio.to_thread(resend.Emails.send, params)
-        return {"sent": True, "id": result.get("id")}
-    except Exception as e:
-        logger.warning(f"resend send failed: {e}")
-        return {"sent": False, "error": str(e)[:200]}
+    """Pluggable email sender. Backend selected via EMAIL_BACKEND env:
+    resend → Resend SaaS API; smtp → local SMTP (e.g. Mailpit in Docker); none → no-op."""
+    if EMAIL_BACKEND == "none":
+        return {"sent": False, "error": "email backend disabled (EMAIL_BACKEND=none)"}
+    if EMAIL_BACKEND == "resend":
+        resend_key = os.environ.get("RESEND_API_KEY")
+        if not resend_key:
+            return {"sent": False, "error": "RESEND_API_KEY not configured"}
+        try:
+            import resend
+            resend.api_key = resend_key
+            params = {
+                "from": os.environ.get("RESEND_FROM", SMTP_FROM),
+                "to": [to_email], "subject": subject, "html": html,
+            }
+            result = await asyncio.to_thread(resend.Emails.send, params)
+            return {"sent": True, "id": result.get("id")}
+        except Exception as e:
+            logger.warning(f"resend send failed: {e}")
+            return {"sent": False, "error": str(e)[:200]}
+    if EMAIL_BACKEND == "smtp":
+        try:
+            import aiosmtplib
+            from email.mime.text import MIMEText
+            from email.mime.multipart import MIMEMultipart
+            msg = MIMEMultipart("alternative")
+            msg["From"] = SMTP_FROM
+            msg["To"] = to_email
+            msg["Subject"] = subject
+            msg.attach(MIMEText(html, "html"))
+            # Use STARTTLS for port 587 (Gmail); use_tls for port 465 (SMTPS).
+            use_tls = SMTP_TLS and SMTP_PORT == 465
+            start_tls = SMTP_TLS and SMTP_PORT != 465
+            await aiosmtplib.send(
+                msg,
+                hostname=SMTP_HOST, port=SMTP_PORT,
+                username=SMTP_USER or None, password=SMTP_PASS or None,
+                use_tls=use_tls, start_tls=start_tls,
+            )
+            return {"sent": True}
+        except Exception as e:
+            logger.warning(f"smtp send failed: {e}")
+            return {"sent": False, "error": str(e)[:200]}
+    return {"sent": False, "error": f"unknown EMAIL_BACKEND: {EMAIL_BACKEND}"}
 
 async def _get_email_prefs(user_id: str) -> Dict[str, Any]:
     prefs = await db.email_prefs.find_one({"user_id": user_id}, {"_id": 0})
@@ -1900,7 +2065,7 @@ class EmailPrefsBody(BaseModel):
 @api.get("/settings/email-prefs")
 async def get_email_prefs(user=Depends(get_current_user)):
     prefs = await _get_email_prefs(user["user_id"])
-    return {**prefs, "resend_configured": bool(os.environ.get("RESEND_API_KEY"))}
+    return {**prefs, "email_backend": EMAIL_BACKEND}
 
 @api.put("/settings/email-prefs")
 async def update_email_prefs(body: EmailPrefsBody, user=Depends(get_current_user)):
@@ -1952,6 +2117,127 @@ async def send_portfolio_digest(user=Depends(get_current_user)):
     return result
 
 
+# ---------------- Observability ----------------
+@api.get("/observability/logs")
+async def obs_logs(
+    log_type: Optional[str] = None,
+    status: Optional[str] = None,
+    agent: Optional[str] = None,
+    limit: int = Query(100, le=500),
+    offset: int = Query(0, ge=0),
+    user=Depends(get_current_user),
+):
+    """Fetch observability logs with optional filters."""
+    query: Dict[str, Any] = {}
+    if log_type:
+        query["type"] = log_type
+    if status:
+        query["status"] = status
+    if agent:
+        query["agent"] = agent
+    cursor = db.obs_logs.find(query, {"_id": 0}).sort("ts", -1).skip(offset).limit(limit)
+    logs = await cursor.to_list(limit)
+    total = await db.obs_logs.count_documents(query)
+    return {"logs": logs, "total": total, "limit": limit, "offset": offset}
+
+
+@api.get("/observability/stats")
+async def obs_stats(user=Depends(get_current_user)):
+    """Aggregate stats for the observability dashboard."""
+    llm_total = await db.obs_logs.count_documents({"type": "llm_call"})
+    llm_success = await db.obs_logs.count_documents({"type": "llm_call", "status": "success"})
+    llm_error = await db.obs_logs.count_documents({"type": "llm_call", "status": "error"})
+    ds_total = await db.obs_logs.count_documents({"type": "data_source"})
+    ds_success = await db.obs_logs.count_documents({"type": "data_source", "status": "success"})
+    ds_error = await db.obs_logs.count_documents({"type": "data_source", "status": "error"})
+    pipeline = [
+        {"$match": {"type": "llm_call"}},
+        {"$group": {"_id": "$agent", "total": {"$sum": 1},
+                     "success": {"$sum": {"$cond": [{"$eq": ["$status", "success"]}, 1, 0]}},
+                     "error": {"$sum": {"$cond": [{"$eq": ["$status", "error"]}, 1, 0]}},
+                     "avg_latency_ms": {"$avg": "$latency_ms"}}},
+        {"$sort": {"total": -1}},
+    ]
+    per_agent = await db.obs_logs.aggregate(pipeline).to_list(50)
+    recent_errors = await db.obs_logs.find(
+        {"status": "error"}, {"_id": 0}
+    ).sort("ts", -1).limit(10).to_list(10)
+    return {
+        "llm": {"total": llm_total, "success": llm_success, "error": llm_error,
+                "success_rate": round(llm_success / llm_total * 100, 1) if llm_total else 0},
+        "data_source": {"total": ds_total, "success": ds_success, "error": ds_error,
+                        "success_rate": round(ds_success / ds_total * 100, 1) if ds_total else 0},
+        "per_agent": per_agent,
+        "recent_errors": recent_errors,
+    }
+
+
+@api.get("/observability/logs/{log_id}")
+async def obs_log_detail(log_id: str, user=Depends(get_current_user)):
+    """Fetch a single observability log entry by its _id."""
+    from bson import ObjectId
+    try:
+        doc = await db.obs_logs.find_one({"_id": ObjectId(log_id)}, {"_id": 0})
+    except Exception:
+        doc = await db.obs_logs.find_one({"log_id": log_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Log not found")
+    return doc
+
+
+# ---------------- Agent Prompt Management ----------------
+@api.get("/agents/prompts")
+async def get_agent_prompts(user=Depends(get_current_user)):
+    """Return all agent system prompts (DB overrides defaults)."""
+    if not _AGENT_SYSTEM_CACHE:
+        await _load_agent_prompts_from_db()
+    prompts = []
+    for key, default_prompt in AGENT_SYSTEM_DEFAULTS.items():
+        doc = await db.agent_prompts.find_one({"key": key}, {"_id": 0})
+        prompts.append({
+            "key": key,
+            "system_prompt": (doc or {}).get("system_prompt", default_prompt),
+            "model": AGENT_CONFIG.get(key, {}).get("model", LLM_MODEL_CHEAP),
+            "temperature": AGENT_CONFIG.get(key, {}).get("temperature", 0.4),
+            "max_evidence": AGENT_CONFIG.get(key, {}).get("max_evidence", 6),
+            "updated_at": (doc or {}).get("updated_at"),
+            "is_custom": doc is not None,
+        })
+    return {"prompts": prompts}
+
+
+@api.put("/agents/prompts/{agent_key}")
+async def update_agent_prompt(agent_key: str, body: Dict[str, Any], user=Depends(get_current_user)):
+    """Update a single agent's system prompt in the DB. No container redeploy needed."""
+    new_prompt = body.get("system_prompt")
+    if not new_prompt or not new_prompt.strip():
+        raise HTTPException(status_code=400, detail="system_prompt must not be empty")
+    if agent_key not in AGENT_SYSTEM_DEFAULTS:
+        raise HTTPException(status_code=404, detail=f"Unknown agent: {agent_key}")
+    await db.agent_prompts.update_one(
+        {"key": agent_key},
+        {"$set": {"key": agent_key, "system_prompt": new_prompt.strip(),
+                  "updated_by": user.get("email", "unknown"),
+                  "updated_at": now_iso()}},
+        upsert=True,
+    )
+    global _AGENT_SYSTEM_CACHE
+    _AGENT_SYSTEM_CACHE[agent_key] = new_prompt.strip()
+    logger.info(f"agent prompt updated: {agent_key} by {user.get('email')}")
+    return {"ok": True, "key": agent_key, "updated_at": now_iso()}
+
+
+@api.post("/agents/prompts/{agent_key}/reset")
+async def reset_agent_prompt(agent_key: str, user=Depends(get_current_user)):
+    """Reset an agent's prompt back to the built-in default."""
+    if agent_key not in AGENT_SYSTEM_DEFAULTS:
+        raise HTTPException(status_code=404, detail=f"Unknown agent: {agent_key}")
+    await db.agent_prompts.delete_one({"key": agent_key})
+    global _AGENT_SYSTEM_CACHE
+    _AGENT_SYSTEM_CACHE[agent_key] = AGENT_SYSTEM_DEFAULTS[agent_key]
+    return {"ok": True, "key": agent_key, "system_prompt": AGENT_SYSTEM_DEFAULTS[agent_key]}
+
+
 app.include_router(api)
 
 # CORS: never allow '*' with credentials. Require explicit origins in prod.
@@ -1973,6 +2259,8 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def startup():
+    # Seed agent prompts into DB on first boot
+    await _load_agent_prompts_from_db()
     # Always register APScheduler (in-process). Celery beat (if running) is an
     # additional scheduler for prod scale — either firing this job is fine
     # (max_instances=1 + coalesce prevents overlap).

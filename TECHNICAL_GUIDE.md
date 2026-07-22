@@ -1,8 +1,8 @@
 # IntelligenceOS — Technical PRD & Architecture Guide
 
-> **Version:** 2.2
-> **Stack:** FastAPI + React (CRA + Tailwind + shadcn/ui) + MongoDB + Redis + Celery + OpenAI LLM (default `gpt-5-nano`)
-> **Scope:** AI investment intelligence platform — 18 differentiated agents, Living Thesis with Assumption Monitor, Decision Journal + Bias Detection, Investment CRM Pipeline, Portfolio Intelligence (Hidden Connections + Macro Exposure), TradingView-style multi-asset Board, Attractiveness Score + Buy/Sell/Hold ratings, cross-document RAG contradiction detection, Timeline, background scheduler, Resend email, **go-live security hardening + deployment-env-driven configuration (no physical `.env` dependency)**.
+> **Version:** 3.0
+> **Stack:** FastAPI + React (CRA + Tailwind + shadcn/ui) + MongoDB (Docker) + Redis + Celery + local LLM gateway (`qwen3.5:4b` / `qwen3:14b` via OpenAI-compatible API)
+> **Scope:** AI investment intelligence platform — **fully self-hosted, zero Emergent platform dependency**. 18 differentiated agents, Living Thesis with Assumption Monitor, Decision Journal + Bias Detection, Investment CRM Pipeline, Portfolio Intelligence (Hidden Connections + Macro Exposure), TradingView-style multi-asset Board, Attractiveness Score + Buy/Sell/Hold ratings, cross-document RAG contradiction detection, Timeline, background scheduler, pluggable email (SMTP/Resend), go-live security hardening, Docker Compose deployment.
 
 This document is the single source of truth for the codebase. It covers architecture, data flow, agent prompts, every screen, every API, env config, infra runtime, and how to extend the template.
 
@@ -41,60 +41,47 @@ IntelligenceOS is a Bloomberg-terminal-inspired dark-theme web app for professio
 flowchart LR
   subgraph Browser
     UI[React SPA<br/>CRA + Tailwind + shadcn/ui + Recharts + React Flow]
-    UI -->|axios credentials:true| GW
+    UI -->|axios Bearer JWT| NGINX
   end
 
-  subgraph Edge
-    GW[Kubernetes Ingress<br/>/api → :8001<br/>/* → :3000]
-  end
-
-  subgraph Backend[FastAPI :8001]
-    RT[/api routes/]
-    AUTH[JWT + Emergent OAuth]
-    AGENTS[Agent Runner<br/>emergentintegrations + AGENT_CONFIG]
-    RAG[BM25 Retrieval<br/>rank_bm25]
-    SCHED[APScheduler in-proc]
-    CACHE[(In-mem TTL Cache)]
-    YF[yfinance client]
-  end
-
-  subgraph Workers[Supervisor Managed]
+  subgraph Docker[Docker Compose]
+    NGINX[nginx :3000<br/>SPA + /api proxy]
+    BE[FastAPI :8001<br/>JWT-only auth]
     REDIS[(Redis 6379)]
-    CW[Celery Worker]
-    CB[Celery Beat]
+    MAILPIT[(Mailpit :8025<br/>SMTP catcher)]
+    MDB[(MongoDB 7<br/>18 collections)]
+    CW[Celery Worker<br/>optional profile]
+    CB[Celery Beat<br/>optional profile]
   end
 
-  subgraph Data
-    MDB[(MongoDB · 18 collections)]
-    LLM[(OpenAI LLM Gateway<br/>default gpt-5-nano)]
-    RESEND[(Resend Email)]
+  subgraph External
+    GW[Local LLM Gateway<br/>:8080/v1<br/>qwen3.5:4b + qwen3:14b]
     YFAPI[(Yahoo Finance)]
-    EMERGENT[(Emergent OAuth backend)]
   end
 
-  RT --> AUTH
-  RT --> AGENTS
-  RT --> RAG
-  RT --> YF
-  RT --> SCHED
-  AGENTS --> LLM
-  YF --> YFAPI
-  YF --> CACHE
-  AUTH --> MDB
-  RT --> MDB
-  RAG --> MDB
-  AUTH -.session_id.-> EMERGENT
-  SCHED -.notifies.-> RESEND
-  CB --> REDIS
+  NGINX -->|/api/*| BE
+  BE --> MDB
+  BE --> REDIS
+  BE -->|chat/completions X-API-Key| GW
+  BE -->|smtp| MAILPIT
+  BE --> YFAPI
   CW --> REDIS
-  CB -.bonus schedule.-> AGENTS
+  CB --> REDIS
+  CW -.bonus schedule.-> BE
 ```
 
-**Runtime processes** (supervisor):
-| Process | Role |
-|---|---|
-| `backend` | FastAPI uvicorn on :8001 |
-| `frontend` | CRA dev server on :3000 |
+**Self-hosted containers** (`docker compose up -d`):
+| Container | Image | Port | Role |
+|---|---|---|---|
+| `mongodb` | `mongo:7` | 27017 | Primary datastore (18 collections) |
+| `redis` | `redis:7-alpine` | 6379 | Celery broker/backend + future cache |
+| `mailpit` | `axllent/mailpit` | 1025 SMTP / 8025 UI | Local email catcher for dev |
+| `backend` | built from `backend/Dockerfile` | 8001 | FastAPI uvicorn |
+| `frontend` | built from `frontend/Dockerfile` | 3000 → nginx | CRA static build served by nginx, proxies `/api/*` to backend |
+| `celery_worker` | built (profile `celery`) | — | Optional horizontal scheduler |
+| `celery_beat` | built (profile `celery`) | — | Optional cron scheduler |
+
+> **No Emergent platform dependency remains.** LLM calls go to your local gateway (`OPENAI_API_BASE`). OAuth is JWT email/password only. Email is SMTP (Mailpit) or Resend (optional). MongoDB runs in the compose stack.
 | `mongodb` | Primary datastore |
 | `redis` | Celery broker/backend (:6379) |
 | `celery_worker` | Executes Celery tasks |
@@ -168,35 +155,31 @@ flowchart LR
 
 ## 4. Environment Variables
 
-> **The backend does NOT require a physical `.env` file to run.** All config is read from `os.environ` (the deployment environment). `load_dotenv()` is called for local-dev convenience only — it silently skips a missing file and never overwrites existing env vars (so platform-injected values always win).
+> **Self-hosted (v3):** All config flows from the root `.env` file consumed by Docker Compose, then injected as env vars into containers. The backend reads `os.environ` — no hard dependency on any physical `.env` file.
 >
 > **File layout:**
-> - `backend/.env` — **committed** to git with **empty values only** (variable names as placeholders). Exists so the Emergent platform's `PullSource`/build step can read the variable manifest. Contains NO secrets.
-> - `backend/.env.example` — committed template with documentation and example values for local dev.
-> - `frontend/.env` — committed with `REACT_APP_BACKEND_URL` + `WDS_SOCKET_PORT` (no secrets; CRA build-time injection).
-> - `frontend/.env.example` — committed template.
->
-> Both `.env` files are gitignored for **local overrides** (when a developer copies `.env.example` → `.env` and fills in real values). The committed placeholder `.env` files are explicitly un-ignored via `!backend/.env` in `.gitignore`.
+> - `.env` (repo root, gitignored) — real secrets; consumed by `docker-compose.yml` via `env_file`. Copy from `.env.example`.
+> - `.env.example` (repo root, committed) — template with documentation and example values.
+> - `backend/.env` — committed placeholder (empty values) for backward-compat with the old Emergent platform build step. Self-host uses the root `.env` instead.
+> - `frontend/.env` — committed; `REACT_APP_BACKEND_URL` baked into the CRA build.
 
-### 4.1 `/app/backend/.env` — deployment env vars
-| Key | Source | Default | Notes |
-|---|---|---|---|
-| `MONGO_URL` | deployment env | `''` (required at runtime) | Mongo connection string. Platform injects. |
-| `DB_NAME` | deployment env | `intelligenc_os` | Database name. |
-| `JWT_SECRET` | deployment env | `''` (required) | **≥32 chars.** App refuses to boot otherwise; `ALLOW_WEAK_JWT=1` overrides for local dev. |
-| `CORS_ORIGINS` | deployment env | `''` | Comma-separated explicit origins. **Never `*` with credentials.** Empty = fail-closed. |
-| `OPENAI_API_KEY` | deployment env | `''` | Primary LLM key. Falls back to legacy `EMERGENT_LLM_KEY` for local dev. |
-| `OPENAI_MODEL` | deployment env | `gpt-5-nano` | Primary model. Falls back to legacy `LLM_MODEL`. |
-| `EMERGENT_LLM_KEY` | local dev | `''` | Legacy alias — `OPENAI_API_KEY` takes precedence. |
-| `LLM_MODEL` | local dev | `gpt-5-nano` | Legacy alias — `OPENAI_MODEL` takes precedence. |
-| `REDIS_URL` | deployment env | `redis://localhost:6379/0` | Celery broker/backend. |
-| `RESEND_API_KEY` | deployment env | `''` | Resend API key. Optional; endpoints degrade gracefully. |
-| `RESEND_FROM` | deployment env | `IntelligenceOS <onboarding@resend.dev>` | Sender identity. Verify a real domain for prod. |
-| `APP_URL` | deployment env | `''` | Public URL for email CTAs. |
-| `COOKIE_SECURE` | deployment env | `true` | Set `false` for local http dev. |
-| `COOKIE_SAMESITE` | deployment env | `none` | `none` (cross-site OAuth) · `lax` · `strict`. |
-| `MAX_UPLOAD_BYTES` | deployment env | `5242880` (5 MB) | Document upload cap; 413 on overflow. |
-| `ALLOW_WEAK_JWT` | local dev | unset | `1` bypasses JWT strength check. Never set in prod. |
+### 4.1 Root `.env` (compose-level, real secrets)
+| Key | Default | Notes |
+|---|---|---|
+| `JWT_SECRET` | (required) | **≥32 chars.** App refuses to boot otherwise; `ALLOW_WEAK_JWT=1` overrides for local dev. Generate: `python -c "import secrets;print(secrets.token_urlsafe(48))"` |
+| `DB_NAME` | `intelligenc_os` | MongoDB database name. |
+| `CORS_ORIGINS` | `http://localhost:3000` | Comma-separated explicit origins. **Never `*`.** |
+| `OPENAI_API_BASE` | `http://host.docker.internal:8080/v1` | Your local LLM gateway. `host.docker.internal` reaches the Docker host. |
+| `OPENAI_API_KEY` | `''` | Gateway `X-API-Key`. Never commit. |
+| `LLM_MODEL_CHEAP` | `qwen3.5:4b` | Fast/cheap model (summarization, briefs, materiality). |
+| `LLM_MODEL_STRONG` | `qwen3:14b` | Reasoning model (financial, contradiction, valuation, assumption_check). |
+| `EMAIL_BACKEND` | `smtp` | `smtp` (Mailpit) · `resend` (SaaS) · `none` (disabled). |
+| `SMTP_FROM` | `IntelligenceOS <noreply@localhost>` | Sender identity for SMTP backend. |
+| `APP_URL` | `http://localhost:3000` | Public URL (baked into frontend build + email CTAs). |
+| `COOKIE_SECURE` | `true` | Set `false` for local http dev. |
+| `COOKIE_SAMESITE` | `none` | `none` · `lax` · `strict`. |
+| `MAX_UPLOAD_BYTES` | `5242880` | Document upload cap (5 MB). |
+| `ALLOW_WEAK_JWT` | unset | `1` bypasses JWT strength check (local dev only). |
 
 > **No `USE_CELERY_BEAT` flag exists.** APScheduler always starts in-process (see §11). Celery beat is opt-in by running worker/beat processes.
 
@@ -832,4 +815,4 @@ These cannot be done from code alone — they require operator access:
 
 ---
 
-*End of document. Version 2.2 — supersedes v2.1, v2.0, and v1.0. `Tech_guide.md` (v1.0) has been deleted; `TECHNICAL_GUIDE.md` is the single source of truth.*
+*End of document. Version 3.0 — fully self-hosted, zero Emergent platform dependency. Supersedes all prior versions. `TECHNICAL_GUIDE.md` is the single source of truth.*

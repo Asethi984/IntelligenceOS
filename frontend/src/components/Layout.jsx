@@ -1,5 +1,5 @@
 import { NavLink, Outlet, useNavigate } from "react-router-dom";
-import { LayoutDashboard, LineChart, Briefcase, FileText, Bot, Filter, Bell, Network, Users, Settings, LogOut, Search, Command, Calculator, FolderOpen, Zap, GitBranch, BookOpen, Clock, LayoutGrid, ThumbsUp } from "lucide-react";
+import { LayoutDashboard, LineChart, Briefcase, FileText, Bot, Filter, Bell, Network, Users, Settings, LogOut, Search, Command, Calculator, FolderOpen, Zap, GitBranch, BookOpen, Clock, LayoutGrid, ThumbsUp, Activity, MessageSquare } from "lucide-react";
 import { useState } from "react";
 import CommandPalette from "@/components/CommandPalette";
 import NotificationBell from "@/components/NotificationBell";
@@ -23,6 +23,8 @@ const NAV = [
   { to: "/alerts", label: "Alerts", icon: Bell },
   { to: "/graph", label: "Knowledge Graph", icon: Network },
   { to: "/team", label: "Team", icon: Users },
+  { to: "/agent-prompts", label: "Agent Prompts", icon: MessageSquare },
+  { to: "/observability", label: "Observability", icon: Activity },
   { to: "/settings", label: "Settings", icon: Settings },
 ];
 

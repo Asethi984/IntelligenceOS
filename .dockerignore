@@ -1,0 +1,30 @@
+# Exclude everything we don't need in the build context
+
+# Git
+.git
+.gitignore
+
+# Node
+node_modules
+frontend/node_modules
+frontend/build
+frontend/.cache
+
+# Python
+__pycache__
+*.pyc
+backend/__pycache__
+backend/.venv
+backend/venv
+
+# Env files with REAL secrets — the committed backend/.env placeholder is
+# empty and gets copied into the image by the backend Dockerfile COPY . .
+# The local .env (with real values) at compose level is injected via env_file.
+.env
+frontend/.env
+
+# Docs / test
+*.md
+test_reports/
+tests/
+.emergent/

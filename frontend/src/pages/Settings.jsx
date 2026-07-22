@@ -77,15 +77,15 @@ export default function Settings() {
 
       <div className="border border-line bg-panel rounded-md p-5" data-testid="email-prefs">
         <div className="flex items-center justify-between mb-3">
-          <div className="flex items-center gap-2"><Mail className="w-4 h-4 text-terminal" /><div className="overline">Email Notifications · Resend</div></div>
+          <div className="flex items-center gap-2"><Mail className="w-4 h-4 text-terminal" /><div className="overline">Email Notifications</div></div>
           <div className="flex items-center gap-2">
-            <span className={`text-[10px] font-mono px-2 py-0.5 rounded border ${prefs?.resend_configured ? "border-positive text-positive" : "border-warning text-warning"}`}>
-              {prefs?.resend_configured ? "CONFIGURED" : "NOT CONFIGURED"}
+            <span className={`text-[10px] font-mono px-2 py-0.5 rounded border ${prefs?.email_backend && prefs.email_backend !== 'none' ? "border-positive text-positive" : "border-warning text-warning"}`}>
+              {prefs?.email_backend ? prefs.email_backend.toUpperCase() : "NONE"}
             </span>
           </div>
         </div>
         <div className="text-xs text-muted-foreground mb-4">
-          Email delivered by <span className="font-mono text-foreground">Resend</span> to <span className="font-mono">{user?.email}</span>.
+          Email delivered via <span className="font-mono text-foreground">{prefs?.email_backend || "none"}</span> to <span className="font-mono">{user?.email}</span>.
         </div>
         <div className="space-y-2 mb-4">
           {[
@@ -104,10 +104,10 @@ export default function Settings() {
           ))}
         </div>
         <div className="flex gap-2">
-          <Button size="sm" variant="outline" className="border-line h-8 text-xs" onClick={sendTest} disabled={testSending || !prefs?.resend_configured} data-testid="send-test-email-btn">
+          <Button size="sm" variant="outline" className="border-line h-8 text-xs" onClick={sendTest} disabled={testSending} data-testid="send-test-email-btn">
             <Send className="w-3 h-3 mr-1" /> {testSending ? "Sending…" : "Send test email"}
           </Button>
-          <Button size="sm" variant="outline" className="border-line h-8 text-xs" onClick={sendDigest} disabled={digestSending || !prefs?.resend_configured} data-testid="send-digest-btn">
+          <Button size="sm" variant="outline" className="border-line h-8 text-xs" onClick={sendDigest} disabled={digestSending} data-testid="send-digest-btn">
             <Mail className="w-3 h-3 mr-1" /> {digestSending ? "Sending…" : "Send weekly digest now"}
           </Button>
         </div>

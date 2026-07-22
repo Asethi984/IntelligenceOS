@@ -33,12 +33,6 @@ export default function Login({ mode = "login" }) {
     }
   };
 
-  const google = () => {
-    // REMINDER: DO NOT HARDCODE THE URL, OR ADD ANY FALLBACKS OR REDIRECT URLS, THIS BREAKS THE AUTH
-    const redirectUrl = window.location.origin + "/auth/callback";
-    window.location.href = `https://auth.emergentagent.com/?redirect=${encodeURIComponent(redirectUrl)}`;
-  };
-
   return (
     <div className="min-h-screen bg-base flex">
       <div className="flex-1 flex items-center justify-center p-8">
@@ -70,14 +64,6 @@ export default function Login({ mode = "login" }) {
           </div>
           <Button type="submit" disabled={busy} data-testid="submit-auth-btn" className="w-full bg-terminal text-black hover:bg-terminal/90 font-medium">
             {busy ? "Working…" : (isSignup ? "Create account" : "Sign in")}
-          </Button>
-          <div className="relative my-4">
-            <div className="absolute inset-0 flex items-center"><div className="w-full border-t border-line" /></div>
-            <div className="relative flex justify-center"><span className="bg-base px-2 overline">or</span></div>
-          </div>
-          <Button type="button" variant="outline" onClick={google} data-testid="google-auth-btn" className="w-full border-line bg-panel hover:bg-surface">
-            <svg className="w-4 h-4 mr-2" viewBox="0 0 24 24"><path fill="#EA4335" d="M12 5c1.6 0 3 .55 4.1 1.6L19 3.7C17.1 2 14.7 1 12 1 7.4 1 3.4 3.6 1.4 7.5l3.4 2.6C5.8 7 8.6 5 12 5z"/><path fill="#4285F4" d="M23 12c0-.8-.1-1.6-.2-2.4H12v4.6h6.2c-.3 1.4-1.1 2.6-2.3 3.4l3.5 2.7C21.7 18.4 23 15.5 23 12z"/><path fill="#FBBC05" d="M4.8 14.1c-.2-.7-.4-1.4-.4-2.1s.1-1.4.4-2.1L1.4 7.3C.5 8.7 0 10.3 0 12s.5 3.3 1.4 4.7l3.4-2.6z"/><path fill="#34A853" d="M12 23c3.2 0 5.9-1 7.9-2.8l-3.5-2.7c-1 .7-2.3 1.1-4.4 1.1-3.4 0-6.2-2-7.2-4.7l-3.4 2.6C3.4 20.4 7.4 23 12 23z"/></svg>
-            Continue with Google
           </Button>
           <div className="text-center text-xs text-muted-foreground">
             {isSignup ? (<>Already have an account? <Link to="/login" className="text-terminal hover:underline">Sign in</Link></>) : (<>New here? <Link to="/signup" className="text-terminal hover:underline">Create account</Link></>)}
